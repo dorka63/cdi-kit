@@ -31,3 +31,7 @@ ghostdriver*
 pip-wheel-metadata/
 .venv/
 docs/_build
+output/
+.pytest_cache/
+__pycache__/
+*.py[cod]
