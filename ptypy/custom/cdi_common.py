@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+from scipy.ndimage import binary_closing, gaussian_filter
 
 from ptypy.core.geometry import Geo
 
@@ -227,6 +228,149 @@ def support_from_npy(
         shape=shape,
         threshold=threshold,
     )
+
+
+def support_from_autocorrelation(
+    diffraction_intensity: Array,
+    *,
+    valid_mask: Array | None = None,
+    gaussian_sigma_px: float | tuple[float, float] | None = 1.0,
+    threshold: float = 0.1,
+    closing_iterations: int = 0,
+) -> Array:
+    """Estimate a binary initial support from diffraction autocorrelation.
+
+    The processing sequence is:
+
+    1. inverse Fourier transform of far-field intensity;
+    2. magnitude of the autocorrelation;
+    3. optional Gaussian smoothing;
+    4. relative thresholding;
+    5. optional binary morphological closing.
+
+    Missing detector pixels are filled with zero for this initial estimate
+    only; they are not interpreted as physically measured zero intensity.
+
+    Parameters
+    ----------
+    diffraction_intensity
+        Two-dimensional nonnegative far-field intensity.
+    valid_mask
+        Boolean detector mask; ``True`` identifies measured pixels. If
+        omitted, every detector pixel is used.
+    gaussian_sigma_px
+        Gaussian standard deviation in pixels. A scalar applies along both
+        axes, and a two-value tuple specifies ``(sigma_rows, sigma_columns)``.
+        ``None`` disables smoothing.
+    threshold
+        Relative threshold in the open interval ``(0, 1)``.
+    closing_iterations
+        Number of binary-closing iterations. Zero disables closing.
+
+    Returns
+    -------
+    numpy.ndarray
+        Boolean support-like mask with the same shape as the input intensity.
+    """
+    intensity = np.asarray(diffraction_intensity)
+
+    if intensity.ndim != 2:
+        raise ValueError(
+            "diffraction_intensity must be a two-dimensional array."
+        )
+
+    if not np.all(np.isfinite(intensity)):
+        raise ValueError(
+            "diffraction_intensity must contain only finite values."
+        )
+
+    if np.any(intensity < 0):
+        raise ValueError(
+            "diffraction_intensity must be non-negative."
+        )
+
+    if valid_mask is None:
+        valid_mask = np.ones(intensity.shape, dtype=bool)
+    else:
+        valid_mask = np.asarray(valid_mask, dtype=bool)
+
+        if valid_mask.shape != intensity.shape:
+            raise ValueError(
+                "valid_mask and diffraction_intensity must have identical "
+                f"shapes; got {valid_mask.shape} and {intensity.shape}."
+            )
+
+    if not np.any(valid_mask):
+        raise ValueError(
+            "valid_mask must contain at least one True pixel."
+        )
+
+    if not 0.0 < threshold < 1.0:
+        raise ValueError(
+            "threshold must lie strictly between 0 and 1."
+        )
+
+    if gaussian_sigma_px is not None:
+        sigma = np.asarray(gaussian_sigma_px, dtype=float)
+
+        if sigma.ndim > 1 or sigma.size not in {1, 2}:
+            raise ValueError(
+                "gaussian_sigma_px must be a scalar, a two-value tuple, "
+                "or None."
+            )
+
+        if np.any(~np.isfinite(sigma)) or np.any(sigma <= 0):
+            raise ValueError(
+                "gaussian_sigma_px must contain positive finite values."
+            )
+
+    if closing_iterations < 0:
+        raise ValueError(
+            "closing_iterations must be non-negative."
+        )
+
+    filled_intensity = np.zeros_like(intensity, dtype=np.float64)
+    filled_intensity[valid_mask] = intensity[valid_mask]
+
+    autocorrelation = np.fft.fftshift(
+        np.fft.ifft2(
+            np.fft.ifftshift(filled_intensity),
+            norm="ortho",
+        )
+    )
+
+    autocorrelation_magnitude = np.abs(autocorrelation)
+
+    if gaussian_sigma_px is not None:
+        autocorrelation_magnitude = gaussian_filter(
+            autocorrelation_magnitude,
+            sigma=gaussian_sigma_px,
+        )
+
+    maximum = float(autocorrelation_magnitude.max())
+
+    if not np.isfinite(maximum) or maximum <= 0.0:
+        raise ValueError(
+            "autocorrelation has no positive finite maximum."
+        )
+
+    support = (
+        autocorrelation_magnitude
+        > threshold * maximum
+    )
+
+    if closing_iterations > 0:
+        support = binary_closing(
+            support,
+            iterations=closing_iterations,
+        )
+
+    if not np.any(support):
+        raise ValueError(
+            "thresholding produced an empty autocorrelation support."
+        )
+
+    return np.asarray(support, dtype=bool)
 
 
 def masked_modulus_projection(

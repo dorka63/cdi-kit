@@ -9,9 +9,15 @@ from ptypy.custom.cdi_common import (
     masked_modulus_projection,
     rectangular_support,
     support_from_array,
+    support_from_autocorrelation,
     support_from_npy,
 )
 
+from ptypy.simulations.cdi_simulation import (
+    amplitude_from_image,
+    farfield_intensity,
+    make_complex_test_object,
+)
 
 def test_circular_support_contains_centre_and_excludes_corner():
     support = circular_support(shape=(11, 11), radius_px=2.0)
@@ -361,3 +367,34 @@ def test_cdi_problem_builds_amplitude_and_applies_data_projection():
         problem.measured_amplitude,
         np.sqrt(intensity),
     )
+
+
+def test_autocorrelation_support_pipeline_runs_for_siemens_star():
+    """Blur, threshold, and closing yield a nontrivial AC support."""
+    image_path = "tutorial/cdi/data/star.png"
+
+    amplitude = amplitude_from_image(image_path)
+
+    object_field, _ = make_complex_test_object(
+        shape=amplitude.shape,
+        amplitude_model="image",
+        amplitude_image_path=image_path,
+        image_binary_threshold=0.5,
+        amplitude_floor=0.0,
+        amplitude_ceiling=1.0,
+        support_radius_fraction=0.25,
+    )
+
+    intensity = farfield_intensity(object_field)
+
+    autocorrelation_support = support_from_autocorrelation(
+        intensity,
+        gaussian_sigma_px=1.0,
+        threshold=0.10,
+        closing_iterations=2,
+    )
+
+    assert autocorrelation_support.dtype == bool
+    assert autocorrelation_support.shape == amplitude.shape
+    assert autocorrelation_support.any()
+    assert not autocorrelation_support.all()
