@@ -1,26 +1,24 @@
-"""CPU utilities shared by experimental CDI reconstruction algorithms.
+"""CPU utilities shared by the custom CDI reconstruction algorithms.
 
-This module provides a small, testable coherent-diffraction-imaging core based
-on PtyPy's physical geometry and propagators. It deliberately does not yet
-implement a registered PtyPy BaseEngine subclass: ER and HIO are first
-validated as numerical reference algorithms before connecting them to the full
-PtyScan/ScanModel/Pod lifecycle.
+Provides support constructors, detector-domain projections, a thin wrapper
+around PtyPy ``Geo`` and its propagator, and ``CDIScan``, which feeds a single
+far-field diffraction pattern into a PtyPy ``Ptycho`` instance.
 """
 
 from __future__ import annotations
 
+import atexit
+import sys
 from dataclasses import dataclass
 
 import numpy as np
 from scipy.ndimage import binary_closing, gaussian_filter
 
-import atexit
-import sys
-
 from ptypy import utils as u
-from ptypy.utils.verbose import headerline
+from ptypy.core.data import PtyScan
 from ptypy.core.geometry import Geo
-
+from ptypy.experiment import register as register_ptyscan
+from ptypy.utils.verbose import headerline
 
 Array = np.ndarray
 
@@ -694,3 +692,175 @@ class CDIProblem:
         candidate = self.geometry.backward(constrained_detector_field)
 
         return candidate, amplitude_error
+
+
+@register_ptyscan("CDIScan")
+class CDIScan(PtyScan):
+    """
+    Single far-field CDI diffraction pattern supplied as an array.
+
+    Defaults:
+
+    [name]
+    default = CDIScan
+    type = str
+    help =
+
+    [intensity]
+    default = None
+    type = ndarray
+    help = Two-dimensional non-negative far-field intensity
+
+    [mask]
+    default = None
+    type = ndarray
+    help = Boolean detector mask, True for valid pixels; None means all valid
+
+    [support]
+    default = None
+    type = Param
+    help = Initial real-space support, computed once when the data are loaded
+
+    [support.kind]
+    default = autocorrelation
+    type = str
+    help = One of autocorrelation, circle, file, array
+
+    [support.threshold]
+    default = 0.04
+    type = float
+    help = Relative autocorrelation threshold (kind = autocorrelation)
+
+    [support.blur_sigma]
+    default = None
+    type = float
+    help = Gaussian blur of the autocorrelation in pixels; None disables it (kind = autocorrelation)
+
+    [support.closing_iterations]
+    default = 0
+    type = int
+    help = Binary closing iterations after thresholding (kind = autocorrelation)
+
+    [support.radius]
+    default = None
+    type = float
+    help = Circle radius in pixels (kind = circle)
+
+    [support.file]
+    default = None
+    type = str
+    help = Path to a .npy support mask (kind = file)
+
+    [support.array]
+    default = None
+    type = ndarray
+    help = Support mask supplied as an array (kind = array)
+
+    """
+
+    def __init__(self, pars=None, **kwargs):
+        p = self.DEFAULT.copy(depth=99)
+        p.update(pars, in_place_depth=99)
+        p.update(kwargs, in_place_depth=99)
+
+        if p.intensity is None:
+            raise ValueError("CDIScan requires data.intensity.")
+
+        intensity = np.asarray(p.intensity, dtype=np.float64)
+
+        if intensity.ndim != 2:
+            raise ValueError("data.intensity must be two-dimensional.")
+
+        if not np.all(np.isfinite(intensity)) or np.any(intensity < 0):
+            raise ValueError("data.intensity must be finite and non-negative.")
+
+        if p.mask is None:
+            mask = np.ones(intensity.shape, dtype=bool)
+        else:
+            mask = np.asarray(p.mask, dtype=bool)
+
+            if mask.shape != intensity.shape:
+                raise ValueError(
+                    "data.mask must have the same shape as data.intensity."
+                )
+
+        p.shape = intensity.shape
+        p.numframes = 1
+
+        super().__init__(p)
+
+        self._intensity = intensity
+        self._mask = mask
+        self.support = self._initial_support(p.support)
+
+    def _initial_support(self, pars):
+        """Compute the initial support from the data.support parameters."""
+        shape = self._intensity.shape
+
+        if pars.kind == "autocorrelation":
+            return support_from_autocorrelation(
+                self._intensity,
+                valid_mask=self._mask,
+                gaussian_sigma_px=pars.blur_sigma,
+                threshold=pars.threshold,
+                closing_iterations=pars.closing_iterations,
+            )
+
+        if pars.kind == "circle":
+            if pars.radius is None:
+                raise ValueError("data.support.radius is required for kind='circle'.")
+            return circular_support(shape=shape, radius_px=pars.radius)
+
+        if pars.kind == "file":
+            if pars.file is None:
+                raise ValueError("data.support.file is required for kind='file'.")
+            return support_from_npy(pars.file, shape=shape)
+
+        if pars.kind == "array":
+            if pars.array is None:
+                raise ValueError("data.support.array is required for kind='array'.")
+            return support_from_array(pars.array, shape=shape)
+
+        raise ValueError(
+            "data.support.kind must be 'autocorrelation', 'circle', 'file', or 'array'."
+        )
+
+    def load_positions(self):
+        return np.zeros((1, 2))
+
+    def load_weight(self):
+        return self._mask.copy()
+
+    def load(self, indices):
+        return {index: self._intensity.copy() for index in indices}, {}, {}
+
+
+def cdi_support(ptycho, pod) -> Array:
+    """Return the current support of the object seen by ``pod``.
+
+    On first access the support is taken from the initial support computed
+    by the scan's ``CDIScan``. Later engines read or replace the same entry.
+    """
+    supports = ptycho.__dict__.setdefault("cdi_supports", {})
+    key = pod.ob_view.storageID
+
+    if key not in supports:
+        supports[key] = pod.model.ptyscan.support.copy()
+
+    return supports[key]
+
+
+def set_cdi_support(ptycho, pod, support: Array) -> None:
+    """Replace the current support of the object seen by ``pod``."""
+    current = cdi_support(ptycho, pod)
+    support = np.asarray(support, dtype=bool)
+
+    if support.shape != current.shape:
+        raise ValueError(
+            f"support shape must be {current.shape}; got {support.shape}."
+        )
+
+    if not np.any(support):
+        raise ValueError("support must contain at least one True pixel.")
+
+    ptycho.cdi_supports[pod.ob_view.storageID] = support.copy()

@@ -1,15 +1,18 @@
-"""CPU Error-Reduction reconstruction for coherent diffraction imaging."""
+"""Error Reduction engine for single-frame far-field CDI."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-
 import numpy as np
 
-from .cdi_common import register_citation
-from .cdi_common import CDIProblem
+from ptypy.core.manager import Full, Vanilla
+from ptypy.custom.cdi_common import (
+    cdi_support,
+    masked_amplitude_error,
+    masked_modulus_projection,
+)
+from ptypy.engines import register
+from ptypy.engines.base import BaseEngine
 
-Array = np.ndarray
 
 ER_ARTICLE = dict(
     comment="The Error Reduction phase-retrieval algorithm",
@@ -22,69 +25,67 @@ ER_ARTICLE = dict(
 )
 
 
-@dataclass
-class ErrorReduction:
-    """Classical CDI Error-Reduction reconstruction.
+@register()
+class CDIER(BaseEngine):
+    """
+    Error Reduction for single-frame far-field CDI.
 
-    The update rule is
+    Defaults:
 
-    .. math::
+    [name]
+    default = CDIER
+    type = str
+    help =
 
-        \\rho_{k+1} = P_S P_M(\\rho_k),
-
-    where ``P_M`` is the masked detector modulus projection and ``P_S`` is
-    the real-space support projection.
     """
 
-    problem: CDIProblem
-    object_field: Array
-    amplitude_errors: list[float] = field(default_factory=list)
-    object_changes: list[float] = field(default_factory=list)
+    SUPPORTED_MODELS = [Vanilla, Full]
 
-    def __post_init__(self) -> None:
-        object_field = np.asarray(self.object_field)
+    def __init__(self, ptycho_parent, pars=None):
+        super().__init__(ptycho_parent, pars)
+        ptycho_parent.citations.add_article(**ER_ARTICLE)
+        self._amplitudes = {}
 
-        if object_field.shape != self.problem.geometry.shape:
-            raise ValueError(
-                "object_field shape must match geometry shape; "
-                f"got {object_field.shape} and "
-                f"{self.problem.geometry.shape}."
-            )
+    def engine_initialize(self):
+        for storage in self.pr.storages.values():
+            storage.fill(1.0)
 
-        if not np.iscomplexobj(object_field):
-            object_field = object_field.astype(np.complex128)
+    def engine_prepare(self):
+        self._amplitudes = {
+            pod_id: np.sqrt(pod.diff) for pod_id, pod in self.pods.items()
+        }
 
-        self.object_field = object_field.astype(np.complex128, copy=True)
-        register_citation(ER_ARTICLE)
+    def engine_iterate(self, num=1):
+        error_dct = {}
 
-    def step(self) -> float:
-        """Perform one Error-Reduction iteration and return its data error."""
-        current = self.object_field
+        for _ in range(num):
+            for name, diff_view in self.di.views.items():
+                if not diff_view.active:
+                    continue
 
-        candidate, amplitude_error = self.problem.data_projection(current)
+                for pod_id, pod in diff_view.pods.items():
+                    current = pod.object.copy()
+                    amplitude = self._amplitudes[pod_id]
+                    detector_field = pod.fw(pod.probe * current)
 
-        updated = candidate * self.problem.support
+                    amplitude_error = masked_amplitude_error(
+                        detector_field, amplitude, pod.mask
+                    )
+                    projected = masked_modulus_projection(
+                        detector_field, amplitude, pod.mask
+                    )
 
-        denominator = np.linalg.norm(current)
-        change = np.linalg.norm(updated - current)
-        relative_change = (
-            float(change / denominator)
-            if denominator > 0.0
-            else float(change)
-        )
+                    updated = pod.bw(projected) * cdi_support(self.ptycho, pod)
+                    pod.object = updated
 
-        self.object_field = updated
-        self.amplitude_errors.append(amplitude_error)
-        self.object_changes.append(relative_change)
+                    norm = np.linalg.norm(current)
+                    change = np.linalg.norm(updated - current) / norm if norm > 0 else 0.0
 
-        return amplitude_error
+                    error_dct[name] = np.array([amplitude_error, 0.0, change])
 
-    def run(self, n_iterations: int) -> Array:
-        """Run ``n_iterations`` ER steps and return the reconstructed object."""
-        if n_iterations <= 0:
-            raise ValueError("n_iterations must be positive.")
+            self.curiter += 1
 
-        for _ in range(n_iterations):
-            self.step()
+        return error_dct
 
-        return self.object_field
+    def engine_finalize(self):
+        pass
