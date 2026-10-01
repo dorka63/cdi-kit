@@ -6,10 +6,22 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from .cdi_common import register_citation
 from .cdi_common import CDIProblem
 
 
 Array = np.ndarray
+
+HIO_ARTICLE = dict(
+    comment="The Hybrid Input-Output phase-retrieval algorithm",
+    title="Phase retrieval algorithms: a comparison",
+    author="Fienup J. R.",
+    journal="Applied Optics",
+    volume=21,
+    year=1982,
+    page=2758,
+    doi="10.1364/AO.21.002758",
+)
 
 
 @dataclass
@@ -52,6 +64,7 @@ class HybridInputOutput:
             object_field = object_field.astype(np.complex128)
 
         self.object_field = object_field.astype(np.complex128, copy=True)
+        register_citation(HIO_ARTICLE)
 
     def step(self) -> float:
         """Perform one HIO iteration and return its data error."""

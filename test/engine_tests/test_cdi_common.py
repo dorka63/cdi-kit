@@ -398,3 +398,51 @@ def test_autocorrelation_support_pipeline_runs_for_siemens_star():
     assert autocorrelation_support.shape == amplitude.shape
     assert autocorrelation_support.any()
     assert not autocorrelation_support.all()
+
+def _small_problem(shape=(16, 16)):
+    geometry = CDIGeometry.from_parameters(
+        shape=shape,
+        energy_kev=8.0,
+        distance_m=1.0,
+        detector_psize_m=55e-6,
+        propagation="farfield",
+        ffttype="numpy",
+    )
+
+    support = rectangular_support(shape=shape, oversampling=2.0)
+
+    return CDIProblem(
+        geometry=geometry,
+        measured_intensity=np.ones(shape),
+        valid_mask=np.ones(shape, dtype=bool),
+        support=support,
+    )
+
+
+def test_set_support_replaces_support_with_independent_copy():
+    problem = _small_problem()
+
+    new_support = np.zeros((16, 16), dtype=bool)
+    new_support[4:8, 4:8] = True
+
+    problem.set_support(new_support)
+
+    np.testing.assert_array_equal(problem.support, new_support)
+    assert problem.support.dtype == bool
+
+    new_support[5, 5] = False
+    assert problem.support[5, 5]
+
+
+def test_set_support_rejects_shape_mismatch():
+    problem = _small_problem()
+
+    with pytest.raises(ValueError, match="shape"):
+        problem.set_support(np.ones((8, 8), dtype=bool))
+
+
+def test_set_support_rejects_empty_support():
+    problem = _small_problem()
+
+    with pytest.raises(ValueError, match="at least one True"):
+        problem.set_support(np.zeros((16, 16), dtype=bool))

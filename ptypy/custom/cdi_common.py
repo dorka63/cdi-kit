@@ -14,10 +14,56 @@ from dataclasses import dataclass
 import numpy as np
 from scipy.ndimage import binary_closing, gaussian_filter
 
+import atexit
+import sys
+
+from ptypy import utils as u
+from ptypy.utils.verbose import headerline
 from ptypy.core.geometry import Geo
 
 
 Array = np.ndarray
+
+CITATIONS = u.Bibliography()
+CITATIONS.add_article(
+    title="A computational framework for ptychographic reconstructions",
+    author="Enders B. and Thibault P.",
+    journal="Proc. Royal Soc. A",
+    volume=472,
+    year=2016,
+    page=20160640,
+    doi="10.1098/rspa.2016.0640",
+    comment="The Ptypy framework",
+)
+
+_citation_report_registered = False
+
+
+def register_citation(article: dict) -> None:
+    """Register an algorithm reference for the end-of-run citation report.
+
+    Called by custom CDI algorithms on construction. The report is printed
+    automatically once, when the Python process exits.
+    """
+    global _citation_report_registered
+
+    CITATIONS.add_article(**article)
+
+    if not _citation_report_registered:
+        atexit.register(_print_citation_report)
+        _citation_report_registered = True
+
+
+def _print_citation_report() -> None:
+    """Print collected references in the same layout as ptypy."""
+    if "pytest" in sys.modules:
+        return
+
+    print("\n".join([
+        headerline("This reconstruction relied on the following work", "l", "="),
+        str(CITATIONS),
+        headerline("", "l", "="),
+    ]))
 
 
 def _validate_shape(shape: tuple[int, int]) -> tuple[int, int]:
@@ -610,6 +656,21 @@ class CDIProblem:
         self.valid_mask = valid_mask
         self.support = support
         self.measured_amplitude = np.sqrt(self.measured_intensity)
+
+    def set_support(self, support: Array) -> None:
+        """Replace the real-space support after validating it."""
+        support = np.asarray(support, dtype=bool)
+
+        if support.shape != self.geometry.shape:
+            raise ValueError(
+                "support shape must match geometry shape; "
+                f"got {support.shape} and {self.geometry.shape}."
+            )
+
+        if not np.any(support):
+            raise ValueError("support must contain at least one True pixel.")
+
+        self.support = support.copy()
 
     def data_projection(
         self,

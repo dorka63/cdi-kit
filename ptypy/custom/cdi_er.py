@@ -6,10 +6,20 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from .cdi_common import register_citation
 from .cdi_common import CDIProblem
 
-
 Array = np.ndarray
+
+ER_ARTICLE = dict(
+    comment="The Error Reduction phase-retrieval algorithm",
+    title="A phase retrieval algorithm for real and imaginary objects",
+    author="Gerchberg R. W. and Saxton W. O.",
+    journal="Optik",
+    volume=35,
+    year=1972,
+    page=237,
+)
 
 
 @dataclass
@@ -45,6 +55,7 @@ class ErrorReduction:
             object_field = object_field.astype(np.complex128)
 
         self.object_field = object_field.astype(np.complex128, copy=True)
+        register_citation(ER_ARTICLE)
 
     def step(self) -> float:
         """Perform one Error-Reduction iteration and return its data error."""
