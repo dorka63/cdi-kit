@@ -1,3 +1,4 @@
+import pytest
 import numpy as np
 
 from ptypy import utils as u
@@ -92,3 +93,11 @@ def test_cdier_adds_its_citation():
     comments = [entry["comment"] for entry in P.citations.entries]
 
     assert "The Error Reduction phase-retrieval algorithm" in comments
+
+def test_cdier_fixes_global_phase_after_engine_block():
+    P, obj, support = _run_cdier(numiter=5)
+
+    assert np.angle(obj[support].sum()) == pytest.approx(
+        0.0,
+        abs=1e-12,
+    )

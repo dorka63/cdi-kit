@@ -14,6 +14,7 @@ from ptypy.custom.cdi_common import (
     support_from_array,
     support_from_autocorrelation,
     support_from_npy,
+    remove_global_phase,
 )
 from ptypy.simulations.cdi_simulation import make_complex_test_object
 
@@ -334,3 +335,36 @@ def test_cdi_scan_passes_detector_mask():
 
     mask_storage = list(P.mask.storages.values())[0]
     np.testing.assert_array_equal(mask_storage.data[0], mask)
+
+def test_remove_global_phase_sets_support_sum_phase_to_zero():
+    obj = np.array(
+        [
+            [0.0 + 0.0j, 1.0 + 1.0j],
+            [2.0 + 2.0j, 1.0 + 1.0j],
+        ]
+    )
+    support = np.ones((2, 2), dtype=bool)
+
+    cleaned = remove_global_phase(obj, support)
+
+    assert np.angle(cleaned[support].sum()) == pytest.approx(
+        0.0,
+        abs=1e-12,
+    )
+
+
+def test_remove_global_phase_preserves_far_field_intensity():
+    geometry = _geometry((32, 32))
+    rng = np.random.default_rng(11)
+
+    obj = rng.normal(size=(32, 32)) + 1j * rng.normal(size=(32, 32))
+    support = np.ones((32, 32), dtype=bool)
+
+    cleaned = remove_global_phase(obj, support)
+
+    np.testing.assert_allclose(
+        np.abs(geometry.forward(cleaned)) ** 2,
+        np.abs(geometry.forward(obj)) ** 2,
+        rtol=1e-12,
+        atol=1e-12,
+    )

@@ -822,12 +822,47 @@ def set_cdi_support(ptycho, pod, support: Array) -> None:
 
     ptycho.cdi_supports[pod.ob_view.storageID] = support.copy()
 
+def remove_global_phase(
+    object_field: Array,
+    support: Array,
+) -> Array:
+    """Set the phase of the complex object sum inside support to zero."""
+    object_field = np.asarray(object_field)
+    support = np.asarray(support, dtype=bool)
+
+    if object_field.ndim != 2:
+        raise ValueError("object_field must be a two-dimensional array.")
+
+    if object_field.shape != support.shape:
+        raise ValueError(
+            "object_field and support must have identical shapes."
+        )
+
+    if not np.any(support):
+        raise ValueError("support must contain at least one True pixel.")
+
+    reference = object_field[support].sum()
+
+    if not np.isfinite(reference) or np.abs(reference) == 0.0:
+        raise ValueError(
+            "object sum inside support is zero; cannot fix global phase."
+        )
+
+    return object_field * np.exp(-1j * np.angle(reference))
+
 class CDIProjectionEngine(BaseEngine):
     """Base class for single-frame CDI engines.
 
     Each iteration applies the detector-modulus projection through the PtyPy
     propagator of the pod and then a real-space update defined by
     ``object_update``. The probe is set to one because CDI has no probe.
+
+    Defaults:
+
+    [phase_gauge]
+    default = True
+    type = bool
+    help = Remove the global object phase after this engine block
     """
 
     SUPPORTED_MODELS = [Vanilla, Full]
@@ -886,4 +921,8 @@ class CDIProjectionEngine(BaseEngine):
         raise NotImplementedError
 
     def engine_finalize(self):
-        pass
+        for pod in self.pods.values():
+            pod.object = remove_global_phase(
+                pod.object,
+                cdi_support(self.ptycho, pod),
+            )
