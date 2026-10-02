@@ -19,6 +19,8 @@ from ptypy.core.data import PtyScan
 from ptypy.core.geometry import Geo
 from ptypy.experiment import register as register_ptyscan
 from ptypy.utils.verbose import headerline
+from ptypy.core.manager import Full, Vanilla
+from ptypy.engines.base import BaseEngine
 
 Array = np.ndarray
 
@@ -864,3 +866,69 @@ def set_cdi_support(ptycho, pod, support: Array) -> None:
         raise ValueError("support must contain at least one True pixel.")
 
     ptycho.cdi_supports[pod.ob_view.storageID] = support.copy()
+
+class CDIProjectionEngine(BaseEngine):
+    """Base class for single-frame CDI engines.
+
+    Each iteration applies the detector-modulus projection through the PtyPy
+    propagator of the pod and then a real-space update defined by
+    ``object_update``. The probe is set to one because CDI has no probe.
+    """
+
+    SUPPORTED_MODELS = [Vanilla, Full]
+
+    def __init__(self, ptycho_parent, pars=None):
+        super().__init__(ptycho_parent, pars)
+        self._amplitudes = {}
+
+    def engine_initialize(self):
+        for storage in self.pr.storages.values():
+            storage.fill(1.0)
+
+    def engine_prepare(self):
+        self._amplitudes = {
+            pod_id: np.sqrt(pod.diff) for pod_id, pod in self.pods.items()
+        }
+
+    def engine_iterate(self, num=1):
+        error_dct = {}
+
+        for _ in range(num):
+            for name, diff_view in self.di.views.items():
+                if not diff_view.active:
+                    continue
+
+                for pod_id, pod in diff_view.pods.items():
+                    current = pod.object.copy()
+                    amplitude = self._amplitudes[pod_id]
+                    detector_field = pod.fw(pod.probe * current)
+
+                    amplitude_error = masked_amplitude_error(
+                        detector_field, amplitude, pod.mask
+                    )
+                    projected = masked_modulus_projection(
+                        detector_field, amplitude, pod.mask
+                    )
+
+                    updated = self.object_update(
+                        current,
+                        pod.bw(projected),
+                        cdi_support(self.ptycho, pod),
+                    )
+                    pod.object = updated
+
+                    norm = np.linalg.norm(current)
+                    change = np.linalg.norm(updated - current) / norm if norm > 0 else 0.0
+
+                    error_dct[name] = np.array([amplitude_error, 0.0, change])
+
+            self.curiter += 1
+
+        return error_dct
+
+    def object_update(self, current, candidate, support):
+        """Return the new object from the current object and the candidate."""
+        raise NotImplementedError
+
+    def engine_finalize(self):
+        pass

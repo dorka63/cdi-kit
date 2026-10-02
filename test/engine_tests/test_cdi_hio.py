@@ -1,171 +1,88 @@
 import numpy as np
-import pytest
 
-from ptypy.custom.cdi_common import (
-    CDIGeometry,
-    CDIProblem,
-)
-from ptypy.custom.cdi_hio import HybridInputOutput
+from ptypy import utils as u
+from ptypy.core import Ptycho
+from ptypy.custom.cdi_common import CDIGeometry
+from ptypy.custom.cdi_hio import CDIHIO
+import ptypy.custom.cdi_er
+from ptypy.engines import by_name
 from ptypy.simulations.cdi_simulation import make_complex_test_object
 
 
-@pytest.fixture
-def hio_problem_and_truth():
-    shape = (64, 64)
+SHAPE = (64, 64)
 
+
+def _run(engines):
+    true_object, support = make_complex_test_object(SHAPE)
     geometry = CDIGeometry.from_parameters(
-        shape=shape,
+        shape=SHAPE,
         energy_kev=8.0,
         distance_m=1.0,
         detector_psize_m=55e-6,
-        propagation="farfield",
         ffttype="numpy",
     )
-
-    true_object, true_support = make_complex_test_object(shape)
-
     intensity = np.abs(geometry.forward(true_object)) ** 2
 
-    problem = CDIProblem(
-        geometry=geometry,
-        measured_intensity=intensity,
-        valid_mask=np.ones(shape, dtype=bool),
-        support=true_support,
+    p = u.Param()
+    p.verbose_level = "error"
+    p.data_type = "double"
+    p.io = u.Param(
+        rfile=None,
+        autosave=u.Param(active=False),
+        autoplot=u.Param(active=False),
+        interaction=u.Param(active=False),
     )
-
-    return problem, true_object
-
-
-def random_phase_initial_guess(
-    shape,
-    support,
-    seed=123,
-):
-    rng = np.random.default_rng(seed)
-    phase = rng.uniform(-np.pi, np.pi, size=shape)
-
-    return support.astype(np.complex128) * np.exp(1j * phase)
-
-
-def test_hio_uses_exact_support_feedback_formula(hio_problem_and_truth):
-    problem, _ = hio_problem_and_truth
-    beta = 0.8
-
-    rng = np.random.default_rng(17)
-    initial = (
-        rng.normal(size=problem.geometry.shape)
-        + 1j * rng.normal(size=problem.geometry.shape)
-    ).astype(np.complex128)
-
-    candidate, _ = problem.data_projection(initial)
-
-    expected = initial.copy()
-    expected[problem.support] = candidate[problem.support]
-    expected[~problem.support] = (
-        initial[~problem.support]
-        - beta * candidate[~problem.support]
+    p.scans = u.Param()
+    p.scans.cdi = u.Param(name="Vanilla")
+    p.scans.cdi.data = u.Param(
+        name="CDIScan",
+        intensity=intensity,
+        energy=8.0,
+        distance=1.0,
+        psize=55e-6,
+        support=u.Param(kind="array", array=support),
     )
+    p.engines = u.Param()
+    for label, engine_pars in engines.items():
+        p.engines[label] = engine_pars
 
-    algorithm = HybridInputOutput(
-        problem=problem,
-        object_field=initial,
-        beta=beta,
-    )
-
-    algorithm.step()
-
-    np.testing.assert_allclose(
-        algorithm.object_field,
-        expected,
-        rtol=1e-12,
-        atol=1e-12,
-    )
+    P = Ptycho(p, level=5)
+    return P, list(P.pods.values())[0].object, support
 
 
-def test_hio_records_one_error_and_one_object_change(hio_problem_and_truth):
-    problem, _ = hio_problem_and_truth
-
-    algorithm = HybridInputOutput(
-        problem=problem,
-        object_field=np.ones(problem.geometry.shape, dtype=np.complex128),
-        beta=0.9,
-    )
-
-    returned_error = algorithm.step()
-
-    assert len(algorithm.amplitude_errors) == 1
-    assert len(algorithm.object_changes) == 1
-    assert returned_error == algorithm.amplitude_errors[0]
-    assert returned_error >= 0.0
-    assert algorithm.object_changes[0] >= 0.0
+def test_cdihio_is_registered():
+    assert by_name("CDIHIO") is CDIHIO
 
 
-def test_hio_reduces_data_error_on_noise_free_synthetic_data(
-    hio_problem_and_truth,
-):
-    problem, _ = hio_problem_and_truth
+def test_cdihio_uses_beta_parameter():
+    P, _, _ = _run({"e0": u.Param(name="CDIHIO", numiter=1, beta=0.5)})
 
-    initial = random_phase_initial_guess(
-        shape=problem.geometry.shape,
-        support=problem.support,
-        seed=10,
-    )
-
-    algorithm = HybridInputOutput(
-        problem=problem,
-        object_field=initial,
-        beta=0.9,
-    )
-
-    initial_error = problem.data_projection(
-        algorithm.object_field
-    )[1]
-
-    assert initial_error > 0.0
-
-    algorithm.run(80)
-
-    final_error = problem.data_projection(
-        algorithm.object_field
-    )[1]
-
-    assert np.isfinite(final_error)
-    assert final_error < initial_error
-    assert np.all(np.isfinite(algorithm.object_field))
+    assert list(P.engines.values())[0].p.beta == 0.5
 
 
-@pytest.mark.parametrize("beta", [0.0, -0.5, 1.1])
-def test_hio_rejects_invalid_beta(hio_problem_and_truth, beta):
-    problem, _ = hio_problem_and_truth
+def test_cdihio_reduces_amplitude_error_on_noise_free_data():
+    P, obj, _ = _run({"e0": u.Param(name="CDIHIO", numiter=100)})
 
-    with pytest.raises(ValueError, match="beta"):
-        HybridInputOutput(
-            problem=problem,
-            object_field=np.ones(problem.geometry.shape, dtype=np.complex128),
-            beta=beta,
-        )
+    errors = [info["error"][0] for info in P.runtime.iter_info]
+
+    assert len(errors) == 100
+    assert min(errors[-10:]) < errors[0]
+    assert np.all(np.isfinite(obj))
 
 
-def test_hio_rejects_nonpositive_iteration_count(hio_problem_and_truth):
-    problem, _ = hio_problem_and_truth
+def test_cdihio_adds_its_citation():
+    P, _, _ = _run({"e0": u.Param(name="CDIHIO", numiter=1)})
 
-    algorithm = HybridInputOutput(
-        problem=problem,
-        object_field=np.ones(problem.geometry.shape, dtype=np.complex128),
-        beta=0.9,
-    )
+    comments = [entry["comment"] for entry in P.citations.entries]
 
-    with pytest.raises(ValueError, match="positive"):
-        algorithm.run(0)
+    assert "The Hybrid Input-Output phase-retrieval algorithm" in comments
 
 
-def test_hio_accepts_real_initial_object(hio_problem_and_truth):
-    problem, _ = hio_problem_and_truth
+def test_hio_then_er_chain_shares_object():
+    P, obj, support = _run({
+        "e0": u.Param(name="CDIHIO", numiter=20),
+        "e1": u.Param(name="CDIER", numiter=5),
+    })
 
-    algorithm = HybridInputOutput(
-        problem=problem,
-        object_field=np.ones(problem.geometry.shape),
-        beta=0.9,
-    )
-
-    assert np.iscomplexobj(algorithm.object_field)
+    assert len(P.runtime.iter_info) == 25
+    np.testing.assert_array_equal(obj[~support], 0.0)
