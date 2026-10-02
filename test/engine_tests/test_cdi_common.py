@@ -3,6 +3,7 @@ import pytest
 
 from ptypy import utils as u
 from ptypy.core import Ptycho
+
 from ptypy.custom.cdi_common import (
     CDIGeometry,
     CDIProblem,

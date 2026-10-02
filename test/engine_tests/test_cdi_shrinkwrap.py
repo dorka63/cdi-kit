@@ -1,89 +1,165 @@
 import numpy as np
 import pytest
 
-from ptypy.custom.cdi_shrinkwrap import ShrinkWrapSupport
+from ptypy import utils as u
+from ptypy.core import Ptycho
+from ptypy.custom.cdi_common import CDIGeometry, cdi_support
+from ptypy.custom.cdi_shrinkwrap import CDIShrinkWrap, shrinkwrap_support
+from ptypy.engines import by_name
+from ptypy.simulations.cdi_simulation import make_complex_test_object
+
+import ptypy.custom.cdi_hio
 
 
-def test_shrinkwrap_returns_boolean_support_with_input_shape():
-    object_field = np.zeros((31, 35), dtype=np.complex128)
-    object_field[10:21, 12:24] = 1.0 + 0.3j
+SHAPE = (64, 64)
 
-    shrinkwrap = ShrinkWrapSupport(
-        gaussian_sigma_px=1.0,
-        threshold=0.2,
-        sigma_decay=1.0,
-        minimum_sigma_px=1.0,
+
+def _run(engines):
+    true_object, initial_support = make_complex_test_object(SHAPE)
+    geometry = CDIGeometry.from_parameters(
+        shape=SHAPE,
+        energy_kev=8.0,
+        distance_m=1.0,
+        detector_psize_m=55e-6,
+        ffttype="numpy",
+    )
+    intensity = np.abs(geometry.forward(true_object)) ** 2
+
+    p = u.Param()
+    p.verbose_level = "error"
+    p.data_type = "double"
+    p.io = u.Param(
+        rfile=None,
+        autosave=u.Param(active=False),
+        autoplot=u.Param(active=False),
+        interaction=u.Param(active=False),
     )
 
-    support = shrinkwrap.update(object_field)
+    p.scans = u.Param()
+    p.scans.cdi = u.Param(name="Vanilla")
+    p.scans.cdi.data = u.Param(
+        name="CDIScan",
+        intensity=intensity,
+        energy=8.0,
+        distance=1.0,
+        psize=55e-6,
+        support=u.Param(kind="array", array=initial_support),
+    )
+
+    p.engines = u.Param()
+    for label, engine_pars in engines.items():
+        p.engines[label] = engine_pars
+
+    reconstruction = Ptycho(p, level=5)
+    pod = next(iter(reconstruction.pods.values()))
+    return reconstruction, pod
+
+
+def test_shrinkwrap_support_finds_bright_region():
+    obj = np.zeros((32, 32), dtype=complex)
+    obj[12:20, 12:20] = 1.0 + 0.5j
+
+    support = shrinkwrap_support(
+        obj,
+        sigma_px=1.0,
+        threshold=0.2,
+    )
 
     assert support.dtype == bool
-    assert support.shape == object_field.shape
-    assert support.any()
-    assert not support.all()
-    assert support[15, 17]
-
-
-def test_shrinkwrap_decay_stops_at_minimum_sigma():
-    shrinkwrap = ShrinkWrapSupport(
-        gaussian_sigma_px=3.0,
-        threshold=0.2,
-        sigma_decay=0.5,
-        minimum_sigma_px=1.5,
-    )
-
-    object_field = np.ones((9, 9), dtype=np.complex128)
-
-    shrinkwrap.update(object_field)
-    assert shrinkwrap.current_sigma_px == pytest.approx((1.5, 1.5))
-
-    shrinkwrap.update(object_field)
-    assert shrinkwrap.current_sigma_px == pytest.approx((1.5, 1.5))
-    assert shrinkwrap.update_count == 2
-
-
-def test_shrinkwrap_accepts_anisotropic_sigmas():
-    shrinkwrap = ShrinkWrapSupport(
-        gaussian_sigma_px=(4.0, 2.0),
-        minimum_sigma_px=(2.0, 1.0),
-        sigma_decay=0.5,
-    )
-
-    object_field = np.ones((11, 13), dtype=np.complex128)
-
-    shrinkwrap.update(object_field)
-
-    assert shrinkwrap.current_sigma_px == pytest.approx((2.0, 1.0))
+    assert support.shape == obj.shape
+    assert support[16, 16]
+    assert not support[0, 0]
 
 
 @pytest.mark.parametrize(
-    "kwargs",
+    ("sigma_px", "threshold"),
     [
-        {"gaussian_sigma_px": 0.0},
-        {"gaussian_sigma_px": (-1.0, 1.0)},
-        {"minimum_sigma_px": 0.0},
-        {"minimum_sigma_px": (1.0, -1.0)},
-        {"threshold": 0.0},
-        {"threshold": 1.0},
-        {"sigma_decay": 0.0},
-        {"sigma_decay": 1.1},
-        {"closing_iterations": -1},
+        (0.0, 0.15),
+        (-1.0, 0.15),
+        (1.0, 0.0),
+        (1.0, -0.1),
+        (1.0, 1.0),
     ],
 )
-def test_shrinkwrap_rejects_invalid_parameters(kwargs):
+def test_shrinkwrap_support_rejects_invalid_parameters(
+    sigma_px,
+    threshold,
+):
     with pytest.raises(ValueError):
-        ShrinkWrapSupport(**kwargs)
+        shrinkwrap_support(
+            np.ones((8, 8), dtype=complex),
+            sigma_px=sigma_px,
+            threshold=threshold,
+        )
 
 
-def test_shrinkwrap_rejects_zero_object_field():
-    shrinkwrap = ShrinkWrapSupport()
-
+def test_shrinkwrap_support_rejects_zero_object():
     with pytest.raises(ValueError, match="positive finite maximum"):
-        shrinkwrap.update(np.zeros((12, 12), dtype=np.complex128))
+        shrinkwrap_support(
+            np.zeros((8, 8), dtype=complex),
+            sigma_px=1.0,
+            threshold=0.15,
+        )
 
 
-def test_shrinkwrap_rejects_non_2d_object_field():
-    shrinkwrap = ShrinkWrapSupport()
+def test_cdi_shrinkwrap_is_registered():
+    assert by_name("CDIShrinkWrap") is CDIShrinkWrap
 
-    with pytest.raises(ValueError, match="two-dimensional"):
-        shrinkwrap.update(np.ones((3, 4, 5), dtype=np.complex128))
+
+def test_cdi_shrinkwrap_updates_support():
+    reconstruction, pod = _run({
+        "e0": u.Param(name="CDIHIO", numiter=10),
+        "e1": u.Param(
+            name="CDIShrinkWrap",
+            numiter=1,
+            gaussian_sigma_px=1.0,
+    	    minimum_sigma_px=1.0,
+            threshold=0.2,
+        ),
+    })
+
+    support = cdi_support(reconstruction, pod)
+
+    assert support.shape == SHAPE
+    assert support.dtype == bool
+    assert support.any()
+    assert len(reconstruction.runtime.iter_info) == 11
+
+
+def test_cdi_shrinkwrap_records_support_change():
+    reconstruction, _ = _run({
+        "e0": u.Param(name="CDIShrinkWrap", numiter=1),
+    })
+
+    info = reconstruction.runtime.iter_info[0]
+
+    assert info["error"][0] == 0.0
+    assert info["error"][1] == 0.0
+    assert 0.0 <= info["error"][2] <= 1.0
+
+
+def test_cdi_shrinkwrap_decays_sigma_to_configured_floor():
+    reconstruction, _ = _run({
+        "e0": u.Param(
+            name="CDIShrinkWrap",
+            numiter=3,
+            gaussian_sigma_px=4.0,
+            sigma_decay=0.5,
+            minimum_sigma_px=1.5,
+        ),
+    })
+
+    engine = next(iter(reconstruction.engines.values()))
+
+    assert engine.update_count == 3
+    assert engine.current_sigma_px == (1.5, 1.5)
+
+
+def test_cdi_shrinkwrap_adds_its_citation():
+    reconstruction, _ = _run({
+        "e0": u.Param(name="CDIShrinkWrap", numiter=1),
+    })
+
+    comments = [entry["comment"] for entry in reconstruction.citations.entries]
+
+    assert "The shrink-wrap support-update algorithm" in comments
