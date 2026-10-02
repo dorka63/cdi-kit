@@ -113,7 +113,7 @@ def test_cdi_shrinkwrap_updates_support():
             name="CDIShrinkWrap",
             numiter=1,
             gaussian_sigma_px=1.0,
-    	    minimum_sigma_px=1.0,
+            minimum_sigma_px=1.0,
             threshold=0.2,
         ),
     })
