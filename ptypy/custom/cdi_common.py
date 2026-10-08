@@ -13,6 +13,8 @@ from itertools import product
 import numpy as np
 from scipy.ndimage import binary_closing, gaussian_filter, map_coordinates, binary_erosion
 from scipy.optimize import minimize
+from scipy.ndimage import distance_transform_edt
+from ptypy.utils.verbose import logger
 from ptypy.utils import parallel
 
 from ptypy.core.data import PtyScan
@@ -754,6 +756,243 @@ def _cdi_pair_correlation(a, b):
     norm = np.linalg.norm(a)*np.linalg.norm(b)
     return float(np.dot(a,b)/norm) if norm > 1e-14 else float("nan")
 
+def sigma_clip_background(
+    values,
+    sigma=3.0,
+    max_iter=5,
+    eps=1e-12,
+):
+    """Estimate background using median/MAD clipping and retained mean."""
+    arr = np.asarray(values, dtype=np.float64).ravel()
+    arr = arr[np.isfinite(arr)]
+
+    sigma = float(sigma)
+    eps = float(eps)
+
+    if not np.isfinite(sigma) or sigma <= 0:
+        raise ValueError("sigma must be positive and finite.")
+
+    if isinstance(max_iter, (bool, np.bool_)):
+        raise ValueError("max_iter must be a nonnegative integer.")
+
+    if int(max_iter) != max_iter or max_iter < 0:
+        raise ValueError("max_iter must be a nonnegative integer.")
+
+    if not np.isfinite(eps) or eps <= 0:
+        raise ValueError("eps must be positive and finite.")
+
+    if arr.size == 0:
+        raise ValueError("No finite pixels available for background estimation.")
+
+    mask = np.ones(arr.shape, dtype=bool)
+
+    for _ in range(int(max_iter)):
+        subset = arr[mask]
+
+        if subset.size == 0:
+            break
+
+        median = np.median(subset)
+        mad = np.median(np.abs(subset - median))
+        sigma_bg = 1.4826 * mad
+
+        if sigma_bg <= eps:
+            break
+
+        new_mask = np.abs(arr - median) < sigma * sigma_bg
+
+        if np.array_equal(new_mask, mask):
+            break
+
+        mask = new_mask
+
+    if not np.any(mask):
+        return float(np.median(arr))
+
+    return float(arr[mask].mean())
+
+
+def butterworth_filter(
+    intensity,
+    valid_mask,
+    *,
+    mode="lowpass",
+    cutoff_frequency_ratio=0.08,
+    order=2,
+    npad=32,
+    mask_policy="error",
+):
+    """Filter detector intensity using a squared Butterworth response."""
+    cutoff = float(cutoff_frequency_ratio)
+    order = float(order)
+
+    if mode not in {"lowpass", "highpass"}:
+        raise ValueError("mode must be 'lowpass' or 'highpass'.")
+
+    if not np.isfinite(cutoff) or not 0 < cutoff <= 0.5:
+        raise ValueError(
+            "cutoff_frequency_ratio must be finite and in (0, 0.5]."
+        )
+
+    if not np.isfinite(order) or order <= 0:
+        raise ValueError("order must be positive and finite.")
+
+    if isinstance(npad, (bool, np.bool_)):
+        raise ValueError("npad must be a nonnegative integer.")
+
+    if int(npad) != npad or npad < 0:
+        raise ValueError("npad must be a nonnegative integer.")
+
+    if mask_policy not in {"error", "nearest"}:
+        raise ValueError("mask_policy must be 'error' or 'nearest'.")
+
+    npad = int(npad)
+    working = intensity.copy()
+
+    if not np.all(valid_mask):
+        if mask_policy == "error":
+            raise ValueError(
+                "Butterworth filtering requires an explicit missing-pixel "
+                "policy. Use mask_policy='nearest' to fill missing pixels "
+                "temporarily for filtering."
+            )
+
+        nearest = distance_transform_edt(
+            ~valid_mask,
+            return_distances=False,
+            return_indices=True,
+        )
+        working[~valid_mask] = working[tuple(nearest[:, ~valid_mask])]
+
+    if npad:
+        working = np.pad(working, npad, mode="edge")
+
+    rows, columns = working.shape
+    fy = np.fft.fftfreq(rows)[:, None]
+    fx = np.fft.rfftfreq(columns)[None, :]
+    radius = np.hypot(fy, fx)
+
+    with np.errstate(over="ignore"):
+        response = 1.0 / (1.0 + (radius / cutoff) ** (2.0 * order))
+
+    spectrum = np.fft.rfft2(working)
+    lowpass = np.fft.irfft2(
+        spectrum * response,
+        s=working.shape,
+    )
+
+    if npad:
+        lowpass = lowpass[npad:-npad, npad:-npad]
+
+    if mode == "lowpass":
+        return lowpass
+
+    return intensity - lowpass
+
+
+def denoise_diffraction_frame(intensity, valid_mask, pars):
+    """Return processed intensity without changing inputs or detector mask."""
+    source = np.asarray(intensity)
+
+    if source.ndim != 2 or np.iscomplexobj(source):
+        raise ValueError("intensity must be a real two-dimensional array.")
+
+    output = source.astype(np.float64, copy=True)
+
+    if not bool(pars.get("active", False)):
+        return output
+
+    if valid_mask is None:
+        valid = np.ones(output.shape, dtype=bool)
+    else:
+        valid = np.asarray(valid_mask, dtype=bool)
+
+    if valid.shape != output.shape:
+        raise ValueError("valid_mask must have the same shape as intensity.")
+
+    if not np.any(valid):
+        raise ValueError("valid_mask contains no valid pixels.")
+
+    if not np.all(np.isfinite(output[valid])):
+        raise ValueError("Valid intensity pixels must be finite.")
+
+    if np.any(output[valid] < 0):
+        raise ValueError("Valid input intensity pixels must be nonnegative.")
+
+    name = pars.get("name", "butterworth")
+    background = None
+
+    if name == "sigma_clip":
+        selected = valid.copy()
+        statistics_mask = pars.get("statistics_mask", None)
+
+        if statistics_mask is not None:
+            statistics_mask = np.asarray(statistics_mask)
+
+            if statistics_mask.shape != output.shape:
+                raise ValueError(
+                    "statistics_mask must have the same shape as intensity."
+                )
+
+            if statistics_mask.dtype != np.dtype(bool):
+                raise TypeError("statistics_mask must be a boolean array.")
+
+            selected &= statistics_mask
+
+        if not np.any(selected):
+            raise ValueError(
+                "statistics_mask selects no valid pixels."
+            )
+
+        background = sigma_clip_background(
+            output[selected],
+            sigma=pars.get("sigma", 3.0),
+            max_iter=pars.get("max_iter", 5),
+        )
+        processed = output - background
+
+    elif name == "butterworth":
+        processed = butterworth_filter(
+            output,
+            valid,
+            mode=pars.get("mode", "lowpass"),
+            cutoff_frequency_ratio=pars.get(
+                "cutoff_frequency_ratio", 0.08
+            ),
+            order=pars.get("order", 2),
+            npad=pars.get("npad", 32),
+            mask_policy=pars.get("mask_policy", "error"),
+        )
+
+    else:
+        raise ValueError(
+            "denoising.name must be 'sigma_clip' or 'butterworth'."
+        )
+
+    if not np.all(np.isfinite(processed[valid])):
+        raise ValueError("Denoising produced nonfinite valid intensities.")
+
+    clipped_fraction = float(np.mean(processed[valid] < 0))
+    output[valid] = np.maximum(processed[valid], 0.0)
+
+    # Invalid pixels remain unmeasured, not reconstructed by denoising.
+    output[~valid] = 0.0
+
+    if bool(pars.get("verbose", False)):
+        message = (
+            f"CDI denoising: method={name}, "
+            f"valid_sum_before={source[valid].sum(dtype=np.float64):.6g}, "
+            f"valid_sum_after={output[valid].sum():.6g}, "
+            f"clipped_fraction={clipped_fraction:.6g}"
+        )
+
+        if background is not None:
+            message += f", background={background:.6g}"
+
+        logger.info(message)
+
+    return output
+
 
 @register_ptyscan("CDIScan")
 class CDIScan(PtyScan):
@@ -847,6 +1086,66 @@ class CDIScan(PtyScan):
     default = None
     type = ndarray
     help = Support mask supplied as an array (kind = array)
+
+    [denoising]
+    default =
+    type = Param
+    help = Optional detector-intensity denoising before spatial preprocessing
+
+    [denoising.active]
+    default = False
+    type = bool
+    help = Enable detector-intensity denoising
+
+    [denoising.name]
+    default = butterworth
+    type = str
+    help = Denoising method: butterworth or sigma_clip
+
+    [denoising.mode]
+    default = lowpass
+    type = str
+    help = Butterworth mode: lowpass or highpass
+
+    [denoising.cutoff_frequency_ratio]
+    default = 0.08
+    type = float
+    help = Butterworth cutoff in cycles per detector pixel
+
+    [denoising.order]
+    default = 2.0
+    type = float
+    help = Positive Butterworth order
+
+    [denoising.npad]
+    default = 32
+    type = int
+    help = Edge padding width before Butterworth filtering
+
+    [denoising.mask_policy]
+    default = error
+    type = str
+    help = Missing-pixel handling for Butterworth: error or nearest
+
+    [denoising.sigma]
+    default = 3.0
+    type = float
+    help = Sigma-clipping multiplier applied to the MAD-based scale
+
+    [denoising.max_iter]
+    default = 5
+    type = int
+    help = Maximum sigma-clipping iterations
+
+    [denoising.statistics_mask]
+    default = None
+    type = ndarray
+    help = Boolean raw-frame mask, True selects pixels for background estimation
+
+    [denoising.verbose]
+    default = False
+    type = bool
+    help = Log processing statistics without storing diagnostics
 
     """
 
@@ -961,6 +1260,35 @@ class CDIScan(PtyScan):
     def load(self, indices):
         return {index: self._intensity.copy() for index in indices}, {}, {}
 
+    def correct(self, raw, weights, common):
+        """Apply optional denoising before spatial preprocessing."""
+        data, weights = super().correct(raw, weights, common)
+
+        pars = self.info.get("denoising", None)
+
+        if pars is None or not pars.get("active", False):
+            return data, weights
+
+        processed = {}
+
+        for index, frame in data.items():
+            frame_weight = weights.get(index)
+
+            if frame_weight is None:
+                frame_weight = self.weight2d
+
+            if frame_weight is None:
+                frame_weight = self._mask
+
+            valid_mask = np.asarray(frame_weight) > 0
+
+            processed[index] = denoise_diffraction_frame(
+                frame,
+                valid_mask,
+                pars,
+            )
+
+        return processed, weights
 
 def cdi_support(ptycho, pod) -> Array:
     """Return the current support of the object seen by ``pod``.
