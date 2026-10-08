@@ -21,6 +21,7 @@ import ptypy.custom.cdi_shrinkwrap
 from ptypy.simulations.cdi_simulation import (
     amplitude_from_image,
     make_complex_test_object,
+    shift_diffraction_pattern,
 )
 
 
@@ -35,6 +36,15 @@ DETECTOR_PSIZE_M = 55e-6
 
 TOTAL_ITERATIONS = 360
 HIO_BETA = 0.5
+
+DETECTOR_SHIFT_PX = (7, -5)
+AUTOCENTER = True
+AUTOCENTER_METHOD = "reflections"
+AUTOCENTER_INITIAL_CENTER = None
+AUTOCENTER_SEARCH_RADIUS_PX = 12.0
+AUTOCENTER_TOLERANCE = 1e-4
+AUTOCENTER_MIN_OVERLAP = 0.5
+MANUAL_CENTER_PX = None
 
 AUTOCORRELATION_THRESHOLD = 0.15
 AUTOCORRELATION_BLUR_SIGMA_PX = None
@@ -217,8 +227,13 @@ def make_parameters(
     intensity: Array,
     support: Array,
     engines: u.Param,
+    *,
+    valid_mask: Array | None = None,
 ) -> u.Param:
     """Create a PtyPy configuration for one single-frame CDI reconstruction."""
+    if not AUTOCENTER and MANUAL_CENTER_PX is None:
+        raise ValueError("Set MANUAL_CENTER_PX when AUTOCENTER is False.")
+
     parameters = u.Param()
     parameters.verbose_level = "info"
     parameters.data_type = "double"
@@ -235,6 +250,21 @@ def make_parameters(
     parameters.scans.cdi.data = u.Param(
         name="CDIScan",
         intensity=intensity,
+        mask=valid_mask,
+        center=None if AUTOCENTER else MANUAL_CENTER_PX,
+        autocenter=AUTOCENTER,
+        autocenter_method=AUTOCENTER_METHOD,
+        autocenter_initial_center=(
+            tuple(np.asarray(intensity.shape, dtype=float) / 2.0)
+            if AUTOCENTER_INITIAL_CENTER is None
+            else AUTOCENTER_INITIAL_CENTER
+        ),
+        autocenter_search_radius=AUTOCENTER_SEARCH_RADIUS_PX,
+        autocenter_tolerance=AUTOCENTER_TOLERANCE,
+        autocenter_min_overlap=AUTOCENTER_MIN_OVERLAP,
+        orientation=None,
+        rebin=1,
+        save=None,
         energy=ENERGY_KEV,
         distance=DISTANCE_M,
         psize=DETECTOR_PSIZE_M,
@@ -265,6 +295,42 @@ def result_from_ptycho(
             for info in reconstruction.runtime.iter_info
         ],
     )
+
+
+def report_centering(
+    name: str,
+    reconstruction: Ptycho,
+    reference_center: Array,
+    expected_center: Array,
+    input_intensity: Array,
+    input_mask: Array,
+) -> Array:
+    """Report the center chosen by the reconstruction's own CDIScan."""
+    model = reconstruction.model.scans["cdi"]
+    measured_center = np.asarray(model.ptyscan.meta.center, dtype=float)
+    geometry_center = np.asarray(model.geometries[0].p.center, dtype=float)
+    pod = next(iter(reconstruction.pods.values()))
+    np.testing.assert_array_equal(pod.diff, input_intensity)
+    np.testing.assert_array_equal(pod.mask, input_mask)
+    np.testing.assert_allclose(geometry_center, measured_center, rtol=0, atol=1e-10)
+    error = measured_center-expected_center
+    print()
+    print(f"Centering diagnostics: {name}")
+    print("Mode:", AUTOCENTER_METHOD if AUTOCENTER else "manual")
+    print("Applied detector shift (row, column):", DETECTOR_SHIFT_PX)
+    print("Reference physical center:", reference_center)
+    print("Expected shifted center:", expected_center)
+    print("Estimated center in metadata:", measured_center)
+    print("Center used by the geometry:", geometry_center)
+    print("Estimated detector shift:", measured_center-reference_center)
+    print("Center error vector:", error)
+    print(f"Center error norm (px): {np.linalg.norm(error):.6f}")
+    if not np.allclose(measured_center, expected_center, rtol=0, atol=1e-10):
+        print("WARNING: the center estimate differs from the known simulated center.")
+    for entry in getattr(model.ptyscan, "centering_diagnostics", {}).values():
+        if entry.get("boundary_hit", False):
+            print("WARNING: the estimate reached the search boundary.")
+    return measured_center
 
 
 def main() -> None:
@@ -298,10 +364,35 @@ def main() -> None:
         ffttype="numpy",
         data_type=np.complex128,
     )
-    measured_intensity = np.abs(geometry.forward(true_object)) ** 2
+    if any(size % 2 for size in shape):
+        raise ValueError("This integer-center tutorial requires even frame dimensions.")
+    reference_intensity = np.abs(geometry.forward(true_object)) ** 2
+    reference_center = np.asarray(shape, dtype=float) / 2.0
+    shift = np.asarray(DETECTOR_SHIFT_PX, dtype=float)
+    if shift.shape != (2,) or not np.isfinite(shift).all() or not np.array_equal(shift, np.rint(shift)):
+        raise ValueError("DETECTOR_SHIFT_PX must contain two finite integers.")
+    expected_center = reference_center + shift
+    if np.any(expected_center < 0) or np.any(expected_center >= np.asarray(shape)):
+        raise ValueError("Expected shifted center is outside the detector frame.")
+    measured_intensity, detector_mask = shift_diffraction_pattern(
+        reference_intensity,
+        shift_px=DETECTOR_SHIFT_PX,
+    )
+    print("Simulated detector shift:", DETECTOR_SHIFT_PX, flush=True)
+    print("Expected detector center:", expected_center, flush=True)
+    print("Centering is performed by each reconstruction's CDIScan.", flush=True)
+
+    # A cyclic integer shift multiplies the inverse FFT by a phase ramp.
+    # Its magnitude, used by support_from_autocorrelation, is unchanged.
+    reference_ac = np.abs(np.fft.ifft2(np.fft.ifftshift(reference_intensity)))
+    shifted_ac = np.abs(np.fft.ifft2(np.fft.ifftshift(measured_intensity)))
+    if not np.allclose(reference_ac, shifted_ac, rtol=1e-9,
+                       atol=1e-12 * max(1.0, float(reference_ac.max()))):
+        raise RuntimeError("Autocorrelation magnitude changed under the cyclic shift.")
 
     autocorrelation_support = support_from_autocorrelation(
         measured_intensity,
+        valid_mask=detector_mask,
         gaussian_sigma_px=AUTOCORRELATION_BLUR_SIGMA_PX,
         threshold=AUTOCORRELATION_THRESHOLD,
         closing_iterations=AUTOCORRELATION_CLOSING_ITERATIONS,
@@ -318,6 +409,7 @@ def main() -> None:
             measured_intensity,
             known_support,
             er_engines,
+            valid_mask=detector_mask,
         ),
         level=5,
     )
@@ -334,6 +426,7 @@ def main() -> None:
             measured_intensity,
             known_support,
             hio_engines,
+            valid_mask=detector_mask,
         ),
         level=5,
     )
@@ -397,9 +490,24 @@ def main() -> None:
             measured_intensity,
             autocorrelation_support,
             shrinkwrap_engines,
+            valid_mask=detector_mask,
         ),
         level=5,
     )
+
+    chosen_centers = [
+        report_centering(
+            name, reconstruction, reference_center, expected_center,
+            measured_intensity, detector_mask,
+        )
+        for name, reconstruction in (
+            ("ER", er_reconstruction),
+            ("HIO", hio_reconstruction),
+            ("HIO + shrink-wrap", shrinkwrap_reconstruction),
+        )
+    ]
+    for center in chosen_centers[1:]:
+        np.testing.assert_array_equal(center, chosen_centers[0])
 
     results = [
         result_from_ptycho("ER", er_reconstruction),

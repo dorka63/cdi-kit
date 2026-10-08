@@ -8,9 +8,12 @@ far-field diffraction pattern into a PtyPy ``Ptycho`` instance.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import product
 
 import numpy as np
-from scipy.ndimage import binary_closing, gaussian_filter
+from scipy.ndimage import binary_closing, gaussian_filter, map_coordinates, binary_erosion
+from scipy.optimize import minimize
+from ptypy.utils import parallel
 
 from ptypy.core.data import PtyScan
 from ptypy.core.geometry import Geo
@@ -651,6 +654,107 @@ class CDIProblem:
         return candidate, amplitude_error
 
 
+def estimate_cdi_center(intensity, valid_mask=None, *, method="mass",
+                        initial_center=None, search_radius=8.0,
+                        tolerance=1e-4, min_overlap=0.5):
+    """Estimate a raw-frame center and return numerical diagnostics.
+
+    CDIScan rounds this estimate before passing it to the geometry.
+    Optimizer tolerance is not a physical accuracy guarantee.
+    """
+    image = np.asarray(intensity, dtype=np.float64)
+    mask = np.ones(image.shape, bool) if valid_mask is None else np.asarray(valid_mask, bool)
+    if image.ndim != 2 or mask.shape != image.shape:
+        raise ValueError("Intensity and mask must be matching 2D arrays.")
+    if not mask.any() or not np.isfinite(image[mask]).all() or (image[mask] < 0).any():
+        raise ValueError("Valid intensities must be finite and nonnegative; mask cannot be empty.")
+    scale = image[mask].max()
+    if scale <= 0:
+        raise ValueError("No positive measured intensity.")
+    image = np.where(mask, image / scale, 0.0)
+    if method == "mass":
+        y, x = np.indices(image.shape, dtype=float)
+        center = np.array([(y*image).sum(), (x*image).sum()]) / image.sum()
+        return tuple(center), dict(method=method, scores=(), boundary_hit=False)
+    if method not in ("inversion", "reflections"):
+        raise ValueError("Unknown autocenter method.")
+    initial = (np.array(image.shape)-1)/2 if initial_center is None else np.asarray(initial_center, float)
+    radius = np.broadcast_to(np.asarray(search_radius, float), (2,))
+    if initial.shape != (2,) or not np.isfinite(initial).all() or not np.isfinite(radius).all() or (radius <= 0).any():
+        raise ValueError("Invalid initial center or radius.")
+    if (initial < 0).any() or (initial > np.array(image.shape)-1).any():
+        raise ValueError("Initial center is outside the frame.")
+    if not 0 < min_overlap <= 1 or not np.isfinite(tolerance) or tolerance <= 0:
+        raise ValueError("Invalid overlap or tolerance.")
+    y, x = np.nonzero(mask)
+    positions = np.vstack([y, x]).astype(float)
+    measured = image[y, x]
+    groups = [(0, 1)] if method == "inversion" else [(0,), (1,)]
+    answer = initial.copy()
+    diagnostics = []
+    eroded = binary_erosion(mask, structure=np.ones((3,3)), iterations=2)
+    for axes in groups:
+        lower = np.maximum(0, initial-radius)
+        upper = np.minimum(np.array(image.shape)-1, initial+radius)
+        grids = [np.arange(np.ceil(2*lower[a]), np.floor(2*upper[a])+1)/2 for a in axes]
+        best = None
+        for values in product(*grids):
+            candidate = initial.copy()
+            candidate[list(axes)] = values
+            mapped = positions.copy()
+            for a in axes:
+                mapped[a] = 2*candidate[a]-positions[a]
+            iy, ix = np.rint(mapped).astype(int)
+            inside = (iy>=0)&(iy<image.shape[0])&(ix>=0)&(ix<image.shape[1])
+            valid = inside.copy()
+            valid[inside] &= mask[iy[inside],ix[inside]]
+            if valid.sum() < max(8, min_overlap*mask.sum()):
+                continue
+            score = _cdi_pair_correlation(measured[valid], image[iy[valid],ix[valid]])
+            if not np.isfinite(score):
+                continue
+            key = (score, valid.sum(), -np.sum((candidate-initial)**2))
+            if best is None or key > best[0]:
+                best = (key, candidate)
+        if best is None:
+            raise ValueError("No symmetry candidate with sufficient overlap and contrast.")
+        coarse = best[1]
+        mapped = positions.copy()
+        for a in axes:
+            mapped[a] = 2*coarse[a]-positions[a]
+        safe = map_coordinates(eroded.astype(float), mapped, order=0, mode="constant", cval=0)>0.5
+        if safe.sum() < max(8, min_overlap*mask.sum()):
+            raise ValueError("Insufficient valid pairs for subpixel refinement.")
+        pos = positions[:,safe]
+        target = measured[safe]
+        bounds = [(max(lower[a],coarse[a]-0.5), min(upper[a],coarse[a]+0.5)) for a in axes]
+        def objective(values):
+            mapped = pos.copy()
+            for a, value in zip(axes, values):
+                mapped[a] = 2*value-pos[a]
+            sampled = map_coordinates(image, mapped, order=1, mode="constant", cval=0)
+            correlation = _cdi_pair_correlation(target, sampled)
+            return 2.0 if not np.isfinite(correlation) else 1.0-correlation
+        result = minimize(objective, coarse[list(axes)], method="Powell", bounds=bounds,
+                          options=dict(xtol=tolerance, ftol=1e-10, maxiter=150))
+        if not result.success:
+            raise ValueError("Center refinement did not converge: " + str(result.message))
+        answer[list(axes)] = result.x
+        hit = any(abs(v-lower[a]) < 0.01 or abs(v-upper[a]) < 0.01 for a,v in zip(axes,result.x))
+        diagnostics.append(dict(axes=axes, score=1-result.fun, overlap=float(safe.mean()),
+                                coarse_center=tuple(coarse), boundary_hit=hit))
+    return tuple(answer), dict(method=method, searches=diagnostics,
+                              boundary_hit=any(item["boundary_hit"] for item in diagnostics))
+
+
+def _cdi_pair_correlation(a, b):
+    """Return normalized correlation for valid paired samples."""
+    a = a-a.mean()
+    b = b-b.mean()
+    norm = np.linalg.norm(a)*np.linalg.norm(b)
+    return float(np.dot(a,b)/norm) if norm > 1e-14 else float("nan")
+
+
 @register_ptyscan("CDIScan")
 class CDIScan(PtyScan):
     """
@@ -672,6 +776,37 @@ class CDIScan(PtyScan):
     default = None
     type = ndarray
     help = Boolean detector mask, True for valid pixels; None means all valid
+
+    [autocenter]
+    default = None
+    type = bool, None
+    help = Estimate the diffraction center automatically when center is None
+
+    [autocenter_method]
+    default = mass
+    type = str
+    help = CDI center estimator
+    choices = mass, inversion, reflections
+
+    [autocenter_initial_center]
+    default = None
+    type = tuple, list, ndarray, None
+    help = Initial center in raw row, column coordinates
+
+    [autocenter_search_radius]
+    default = 8.0
+    type = float
+    help = Center search radius in raw pixels
+
+    [autocenter_tolerance]
+    default = 0.0001
+    type = float
+    help = Optimizer tolerance, not an accuracy guarantee
+
+    [autocenter_min_overlap]
+    default = 0.5
+    type = float
+    help = Minimum valid pair fraction
 
     [support]
     default = None
@@ -749,6 +884,41 @@ class CDIScan(PtyScan):
         self._intensity = intensity
         self._mask = mask
         self.support = self._initial_support(p.support)
+
+    def _mpi_autocenter(self, data, weights):
+        """Return an integer center using the existing preprocessing hook."""
+        if self.info.autocenter_method == "mass":
+            center = super()._mpi_autocenter(data, weights)
+            return np.rint(center).astype(int)
+        local = {}
+        for index, frame in data.items():
+            try:
+                center, diagnostics = estimate_cdi_center(
+                    frame, weights[index] > 0,
+                    method=self.info.autocenter_method,
+                    initial_center=self.info.autocenter_initial_center,
+                    search_radius=self.info.autocenter_search_radius,
+                    tolerance=self.info.autocenter_tolerance,
+                    min_overlap=self.info.autocenter_min_overlap,
+                )
+                local[index] = dict(center=center, diagnostics=diagnostics, error=None)
+            except Exception as error:
+                local[index] = dict(error=str(error))
+        gathered = parallel.gather_dict(local)
+        payload = None
+        if parallel.master:
+            errors = [item["error"] for item in gathered.values() if item["error"]]
+            if errors or not gathered:
+                payload = dict(error="; ".join(errors) or "No diffraction frames.")
+            else:
+                payload = dict(error=None,
+                    center=np.mean([item["center"] for item in gathered.values()], axis=0),
+                    diagnostics={key: item["diagnostics"] for key,item in gathered.items()})
+        payload = parallel.bcast(payload)
+        if payload["error"]:
+            raise ValueError("CDI autocenter failed: " + payload["error"])
+        self.centering_diagnostics = payload["diagnostics"]
+        return np.rint(payload["center"]).astype(int)
 
     def _initial_support(self, pars):
         """Compute the initial support from the data.support parameters."""

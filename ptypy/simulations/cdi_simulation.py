@@ -8,7 +8,6 @@ share the same physics.
 from __future__ import annotations
 
 from pathlib import Path
-
 import numpy as np
 
 from ptypy import io
@@ -195,3 +194,75 @@ def make_complex_test_object(
     object_field = support * amplitude * np.exp(1j * _default_phase((rows, columns)))
 
     return object_field.astype(np.complex128), support
+
+
+def shift_diffraction_pattern(
+    intensity: Array,
+    shift_px: tuple[int, int] = (7, -5),
+    *,
+    valid_mask: Array | None = None,
+) -> tuple[Array, Array]:
+    """Apply a reversible integer detector shift to intensity and mask.
+
+    Parameters
+    ----------
+    intensity
+        Two-dimensional nonnegative diffraction intensity.
+    shift_px
+        Integer displacement in (row, column) order. Positive values move
+        the pattern down and right. The default shift is (7, -5).
+    valid_mask
+        Detector validity mask transported with the synthetic pattern.
+        None means that every input pixel is valid.
+
+    Returns
+    -------
+    shifted_intensity, shifted_mask
+        Independent arrays with unchanged shape and sampling.
+
+    Notes
+    -----
+    This deliberately uses periodic np.roll boundaries: no data are lost
+    and no interpolation is performed. It is a controlled registration
+    test, not a finite-detector translation model. A physical beamstop or
+    detector-gap mask fixed in detector coordinates should instead be
+    applied after this operation.
+
+    The object field is not translated. Call this function after computing
+    intensity with the same propagator used for reconstruction.
+    """
+    intensity = np.asarray(intensity)
+
+    if intensity.ndim != 2 or any(size == 0 for size in intensity.shape):
+        raise ValueError("intensity must be a nonempty two-dimensional array.")
+
+    if np.iscomplexobj(intensity):
+        raise ValueError("intensity must be real-valued.")
+
+    if not np.all(np.isfinite(intensity)) or np.any(intensity < 0):
+        raise ValueError("intensity must be finite and nonnegative.")
+
+    shift = np.asarray(shift_px, dtype=float)
+    if shift.shape != (2,) or not np.all(np.isfinite(shift)):
+        raise ValueError("shift_px must contain two finite integer values.")
+
+    if not np.array_equal(shift, np.rint(shift)):
+        raise ValueError("Fractional detector shifts are not supported.")
+
+    if np.any(np.abs(shift) > np.iinfo(np.intp).max // 2):
+        raise ValueError("shift_px is outside the supported integer range.")
+
+    shift = tuple(int(value) for value in shift)
+
+    if valid_mask is None:
+        mask = np.ones(intensity.shape, dtype=bool)
+    else:
+        mask = np.asarray(valid_mask, dtype=bool)
+        if mask.shape != intensity.shape:
+            raise ValueError("valid_mask and intensity must have identical shapes.")
+
+    shifted_intensity = np.roll(intensity, shift=shift, axis=(0, 1))
+    shifted_mask = np.roll(mask, shift=shift, axis=(0, 1))
+
+    return shifted_intensity, shifted_mask
+
