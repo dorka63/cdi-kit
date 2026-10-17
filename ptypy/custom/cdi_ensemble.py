@@ -13,7 +13,6 @@ from ptypy.engines import by_name
 from ptypy.utils import parallel
 from ptypy.custom.cdi_common import (
     CDIProjectionEngine, cdi_support, set_cdi_support,
-    masked_amplitude_error, remove_global_phase,
 )
 import ptypy.custom.cdi_er
 import ptypy.custom.cdi_hio
@@ -57,7 +56,10 @@ def svd_modes(fields, num_modes=1):
 
 
 def _execute_member(ptycho, pod, field, support, chain):
-    """Run a member in a process-local Ptycho workspace."""
+    """Run one member; no ensemble residual or ranking is calculated.
+
+    Standard engines retain their own diagnostics inside Ptycho.run().
+    """
     pod.object = field.copy()
     pod.probe = np.ones(pod.probe.shape, dtype=ptycho.CType)
     pod.exit = pod.probe * pod.object
@@ -69,12 +71,9 @@ def _execute_member(ptycho, pod, field, support, chain):
             engine.label = label
             ptycho.run(engine=engine)
     result = pod.object.copy()
-    error = masked_amplitude_error(
-        pod.fw(pod.probe * result), np.sqrt(pod.diff), pod.mask,
-    )
-    if not np.isfinite(result).all() or not np.isfinite(error):
+    if not np.isfinite(result).all():
         raise ValueError("Reconstruction produced nonfinite values.")
-    return result, error
+    return result
 
 
 def _initialize_worker(parameters):
@@ -87,8 +86,7 @@ def _initialize_worker(parameters):
 
 def _worker_task(index, field, support, chain):
     ptycho, pod = _WORKER
-    result, error = _execute_member(ptycho, pod, field, support, chain)
-    return index, result, error
+    return index, _execute_member(ptycho, pod, field, support, chain)
 
 
 class CDIEnsemble:
@@ -97,7 +95,11 @@ class CDIEnsemble:
     workers=1 uses the parent workspace. workers>1 lazily starts a persistent
     spawn-based process pool. No spatial alignment or field replacement by
     SVD is performed. Engine-local schedules restart for each block.
-    close() releases the pool; member arrays remain available for analysis.
+    Initial fields have random amplitude and zero phase inside the support.
+    svd() uses all fields and stores mode zero as result; no member ranking.
+    close() only releases resources. finalize() additionally saves result when
+    io.rfile is configured. A normal context-manager exit calls finalize().
+    No shrink-wrap implementation is included.
     """
     def __init__(self, parameters, seeds=range(8), workers=1):
         if parallel.size != 1:
@@ -115,6 +117,10 @@ class CDIEnsemble:
         p = u.Param()
         p.update(parameters, in_place_depth=99)
         p = p.copy(depth=99)
+        requested_io = u.Param()
+        if p.get("io") is not None:
+            requested_io.update(p.io, in_place_depth=99)
+        requested_io = requested_io.copy(depth=99)
         if len(p.scans) != 1:
             raise ValueError("Exactly one scan is required.")
         self.scan_label = next(iter(p.scans))
@@ -125,6 +131,11 @@ class CDIEnsemble:
                        autoplot=u.Param(active=False), interaction=u.Param(active=False))
         self.engines = self._validate_engines(p.get("engines", u.Param()))
         self.ptycho = Ptycho(p, level=2)
+        self._result_io = self.ptycho.p.io.copy(depth=99)
+        self._result_io.update(requested_io, in_place_depth=99)
+        self._result_io.rfile = requested_io.get("rfile", None)
+        self._finalized = False
+        self.result = None
         pods = list(self.ptycho.pods.values())
         if len(pods) != 1 or not pods[0].active:
             raise ValueError("Exactly one active POD is required.")
@@ -133,21 +144,17 @@ class CDIEnsemble:
         self.support = cdi_support(self.ptycho, self.pod).copy()
         if self.support.shape != self.pod.object.shape:
             raise ValueError("Support and object shapes must match.")
-        self.amplitude = np.sqrt(self.pod.diff.copy())
-        power = float(np.sum(self.pod.diff[self.pod.mask]))
-        if not np.isfinite(power) or power <= 0:
-            raise ValueError("Valid data must have positive finite total intensity.")
-        level = np.sqrt(power / np.count_nonzero(self.support))
-        self.fields = np.empty((len(self.seeds), *self.support.shape), dtype=self.ptycho.CType)
+        self.fields = np.empty(
+            (len(self.seeds), *self.support.shape), dtype=self.ptycho.CType,
+        )
         for index, seed in enumerate(self.seeds):
-            phase = np.random.default_rng(seed).uniform(-np.pi, np.pi, self.support.shape)
-            self.fields[index] = remove_global_phase(
-                level * self.support * np.exp(1j * phase), self.support,
-            )
+            rng = np.random.default_rng(seed)
+            self.fields[index] = rng.random(size=self.support.shape) * self.support
         self.completed_stages = 0
         self.iterations_per_member = 0
-        self.selected_indices = None
-        self.final_errors = self._errors(self.fields)
+        self._last_support = self.support.copy()
+        self._result_support = None
+        self._last_chain = self.engines.copy(depth=99)
         self._restore_workspace()
 
         # Workers receive the final detector data, not the raw input TIFF.
@@ -188,28 +195,27 @@ class CDIEnsemble:
         self.pod.exit = self.pod.probe * self.pod.object
         set_cdi_support(self.ptycho, self.pod, self.support)
 
-    def _errors(self, fields):
-        return np.asarray([masked_amplitude_error(
-            self.pod.fw(self.pod.probe * field), self.amplitude, self.pod.mask,
-        ) for field in fields])
+
 
     def run(self, engines=None):
-        """Advance all members, committing arrays only after full success."""
+        """Advance every field using the same chain; return self.
+
+        This is one stage, not the end of the complete reconstruction.
+        A new stage invalidates the previously computed primary SVD result.
+        """
         if self._closed:
             raise RuntimeError("This ensemble is closed; construct another to resume execution.")
         chain = self._validate_engines(self.engines if engines is None else engines)
         if not chain:
             raise ValueError("Provide a nonempty engine chain.")
         updated = np.empty_like(self.fields)
-        errors = np.empty(len(self.fields))
         try:
             if self.workers == 1:
                 for index, field in enumerate(self.fields):
-                    updated[index], errors[index] = _execute_member(
+                    updated[index] = _execute_member(
                         self.ptycho, self.pod, field, self.support, chain,
                     )
             else:
-                # Spawned interpreters inherit limits before importing NumPy.
                 old_env = {key: os.environ.get(key) for key in _THREAD_VARIABLES}
                 try:
                     for key in _THREAD_VARIABLES:
@@ -230,9 +236,8 @@ class CDIEnsemble:
                         else:
                             os.environ[key] = value
                 for future in futures:
-                    index, field, error = future.result()
+                    index, field = future.result()
                     updated[index] = field
-                    errors[index] = error
         except BaseException:
             if self._pool is not None:
                 self._pool.shutdown(wait=True, cancel_futures=True)
@@ -241,22 +246,25 @@ class CDIEnsemble:
         finally:
             self._restore_workspace()
         self.fields = updated
-        self.final_errors = errors
         self.completed_stages += 1
         self.iterations_per_member += sum(pars.numiter for pars in chain.values())
-        self.selected_indices = None
+        self._last_chain = chain.copy(depth=99)
+        self._last_support = self.support.copy()
+        self.result = None
+        self._result_support = None
         self._restore_workspace()
         return self
 
-    def svd(self, keep=None, num_modes=1):
-        count = len(self.fields) if keep is None else keep
-        if isinstance(count, (bool, np.bool_)) or not isinstance(count, (int, np.integer)) or not 1 <= count <= len(self.fields):
-            raise ValueError("Invalid keep count.")
-        errors = self._errors(self.fields)
-        indices = np.argsort(errors, kind="stable")[:count]
-        modes, weights = svd_modes(self.fields[indices], num_modes=num_modes)
-        self.final_errors = errors
-        self.selected_indices = indices.copy()
+    def svd(self, num_modes=1):
+        """Use ALL fields, return (modes, full weights), and cache mode zero.
+
+        No residuals, ranking, member rejection or spatial alignment.
+        Calling svd() does not save files or change member fields.
+        After editing fields directly, call svd() again before saving.
+        """
+        modes, weights = svd_modes(self.fields, num_modes=num_modes)
+        self.result = modes[0].copy()
+        self._result_support = self._last_support.copy()
         return modes, weights
 
     def set_support(self, support):
@@ -265,7 +273,85 @@ class CDIEnsemble:
             raise TypeError("support must be a boolean array.")
         set_cdi_support(self.ptycho, self.pod, support)
         self.support = support.copy()
-        self.selected_indices = None
+
+    def save_run(self, alt_file=None, kind=None, force_overwrite=True):
+        """Save ONE primary field through the unmodified Ptycho.save_run().
+
+        Ordinary results are stored in the standard object storage. The
+        ensemble itself is not serialized, and support is not added to the
+        file format. Final errors of a worker are not errors of an SVD mode.
+        """
+        if self.completed_stages == 0:
+            raise RuntimeError("Run at least one reconstruction stage before saving.")
+        if alt_file is None and not self._result_io.rfile:
+            raise ValueError("Set io.rfile or provide alt_file to save_run().")
+        save_kind = self._result_io.rformat if kind is None else kind
+        if save_kind not in ("minimal", "dls"):
+            raise ValueError("Ensemble results support rformat='minimal' or 'dls'.")
+        if self.result is None:
+            self.svd(num_modes=1)
+
+        from ptypy.core.paths import Paths
+        parent = self.ptycho
+        old_object = self.pod.object.copy()
+        old_probe = self.pod.probe.copy()
+        old_exit = self.pod.exit.copy()
+        old_support = cdi_support(parent, self.pod).copy()
+        old_parameters = parent.p
+        old_runtime = parent.runtime
+        old_paths = parent.paths
+        try:
+            self.pod.object = self.result.astype(parent.CType, copy=True)
+            self.pod.probe = np.ones_like(self.pod.probe)
+            self.pod.exit = self.pod.probe * self.pod.object
+            set_cdi_support(parent, self.pod, self._result_support)
+            parent.p = old_parameters.copy(depth=99)
+            parent.p.io = self._result_io.copy(depth=99)
+            parent.p.engines = self._last_chain.copy(depth=99)
+            # Preserve the resolved raw-input center in the standard parameters.
+            scan = parent.model.scans[self.scan_label].ptyscan
+            if scan.info.center is not None:
+                parent.p.scans[self.scan_label].data.center = tuple(
+                    float(value)
+                    for value in scan.info.center
+                )
+            parent.runtime = old_runtime.copy(depth=99)
+            parent.runtime.iter_info = []
+            parent.runtime.engine = "CDIEnsemble"
+            parent.runtime.iterations = self.iterations_per_member
+            parent.runtime.cdi_result = "svd_mode_0"
+            parent.paths = Paths(parent.p.io)
+            parent.paths.runtime.engine = "CDIEnsemble"
+            parent.paths.runtime.iteration = self.iterations_per_member
+            parent.paths.runtime.iterations = self.iterations_per_member
+            return parent.save_run(
+                alt_file=None if alt_file is None else os.fspath(alt_file),
+                kind=save_kind,
+                force_overwrite=force_overwrite,
+            )
+        finally:
+            self.pod.object = old_object
+            self.pod.probe = old_probe
+            self.pod.exit = old_exit
+            set_cdi_support(parent, self.pod, old_support)
+            parent.p = old_parameters
+            parent.runtime = old_runtime
+            parent.paths = old_paths
+
+    def finalize(self):
+        """Save the final primary mode if io.rfile is set, then close workers.
+
+        Called on a normal context-manager exit, not between stages.
+        A failed save is propagated; workers are still shut down.
+        """
+        if self._finalized:
+            return
+        try:
+            if self.completed_stages and self._result_io.rfile:
+                self.save_run()
+        finally:
+            self.close()
+        self._finalized = True
 
     def close(self):
         """Release workers while retaining fields and SVD access."""
@@ -278,4 +364,8 @@ class CDIEnsemble:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        self.close()
+        if exc_type is None:
+            self.finalize()
+        else:
+            self.close()
+        return False

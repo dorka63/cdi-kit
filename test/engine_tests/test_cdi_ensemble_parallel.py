@@ -1,4 +1,4 @@
-"""Serial/parallel equivalence tests for CDI ensembles."""
+"""Serial/parallel equivalence of residual-free CDI ensembles."""
 import numpy as np
 import pytest
 from ptypy import utils as u
@@ -15,6 +15,7 @@ def _parameters(propagation):
     mask = np.ones(obj.shape, bool)
     mask[7:9, 7:9] = False
     p = u.Param(verbose_level="error", data_type="double")
+    p.io = u.Param(rfile=None)
     p.scans = u.Param(cdi=u.Param(name="Vanilla", propagation=propagation, ffttype="numpy",
         data=u.Param(name="CDIScan", intensity=intensity, mask=mask, energy=8.,
             distance=1., psize=55e-6, center="fftshift", autocenter=False,
@@ -34,7 +35,6 @@ def test_parallel_matches_serial_across_support_updates(propagation):
         parallel.run()
         pool = parallel._pool
         np.testing.assert_allclose(parallel.fields, serial.fields, rtol=1e-10, atol=1e-10)
-        np.testing.assert_allclose(parallel.final_errors, serial.final_errors, rtol=1e-10, atol=1e-10)
         data = parallel.pod.diff.copy()
         mask = parallel.pod.mask.copy()
         support = serial.support.copy()
@@ -48,8 +48,8 @@ def test_parallel_matches_serial_across_support_updates(propagation):
         np.testing.assert_allclose(parallel.fields, serial.fields, rtol=1e-10, atol=1e-10)
         np.testing.assert_array_equal(parallel.pod.diff, data)
         np.testing.assert_array_equal(parallel.pod.mask, mask)
-        sm, sw = serial.svd(keep=2)
-        pm, pw = parallel.svd(keep=2)
+        sm, sw = serial.svd(num_modes=2)
+        pm, pw = parallel.svd(num_modes=2)
         np.testing.assert_allclose(pw, sw, rtol=1e-10, atol=1e-10)
         np.testing.assert_allclose(np.abs(pm), np.abs(sm), rtol=1e-10, atol=1e-10)
     assert parallel._pool is None

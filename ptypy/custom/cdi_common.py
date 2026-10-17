@@ -1378,6 +1378,20 @@ class CDIProjectionEngine(BaseEngine):
             pod_id: np.sqrt(pod.diff) for pod_id, pod in self.pods.items()
         }
 
+        # Keep the resolved raw-frame center in the standard saved parameters.
+        # PtyScan.info.center is before orientation/crop/rebin; Geo.p.center
+        # belongs to the processed grid and must not replace a raw-frame input.
+        for label, model in self.ptycho.model.scans.items():
+            scan = model.ptyscan
+            if not isinstance(scan, CDIScan):
+                continue
+            center = scan.info.center
+            if center is not None:
+                self.ptycho.p.scans[label].data.center = tuple(
+                    float(value)
+                    for value in center
+                )
+
     def engine_iterate(self, num=1):
         error_dct = {}
 
