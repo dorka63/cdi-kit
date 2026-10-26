@@ -181,3 +181,53 @@ def test_exception_exit_does_not_save(tmp_path):
             raise RuntimeError("abort")
     assert not path.exists()
     assert ensemble._closed
+
+
+@pytest.mark.parametrize("rebin", [1, 2])
+def test_ensemble_native_rectangle_binning_and_initialization(rebin):
+    from ptypy.custom.cdi_common import rectangular_support
+    p = parameters("nearfield")
+    p.scans.cdi.data.rebin = rebin
+    p.scans.cdi.data.support = u.Param(kind="rectangle", oversampling=2.0)
+    with CDIEnsemble(p, seeds=(1, 2)) as ensemble:
+        shape = (16 // rebin, 16 // rebin)
+        assert ensemble.fields.shape == (2, *shape)
+        np.testing.assert_array_equal(ensemble.support, rectangular_support(shape, 2.0))
+        assert np.all(ensemble.fields.imag == 0)
+        assert np.all(ensemble.fields.real >= 0)
+        worker_data = ensemble._worker_parameters.scans.cdi.data
+        assert worker_data.rebin == 1
+        np.testing.assert_array_equal(worker_data.intensity, ensemble.pod.diff)
+        np.testing.assert_array_equal(worker_data.support.array, ensemble.support)
+        ensemble.run()
+        modes, _ = ensemble.svd()
+        assert modes.shape == (1, *shape)
+
+
+def test_support_factory_override_is_visible_to_ensemble():
+    p = parameters("nearfield")
+    p.scans.cdi.data.rebin = 2
+    p.scans.cdi.data.support = u.Param(kind="rectangle", oversampling=2.0)
+    def factory(pod):
+        mask = np.zeros(pod.object.shape, bool)
+        mask[1:4, 2:5] = True
+        return mask
+    with CDIEnsemble(p, seeds=(1, 2), support_factory=factory) as ensemble:
+        np.testing.assert_array_equal(ensemble.support, factory(ensemble.pod))
+        np.testing.assert_array_equal(cdi_support(ensemble.ptycho, ensemble.pod), ensemble.support)
+
+
+def test_binned_rectangle_result_saves_and_loads(tmp_path):
+    path = tmp_path / "binned.ptyr"
+    p = parameters("nearfield", filename=path)
+    p.scans.cdi.data.rebin = 2
+    p.scans.cdi.data.support = u.Param(kind="rectangle", oversampling=2.0)
+    with CDIEnsemble(p, seeds=(1, 2)) as ensemble:
+        ensemble.run()
+        ensemble.svd()
+        expected = ensemble.result.copy()
+    loaded = Ptycho.load_run(str(path), load_data=False)
+    data = next(iter(loaded.obj.storages.values())).data
+    np.testing.assert_allclose(data[0], expected)
+    assert loaded.p.scans.cdi.data.rebin == 2
+    assert loaded.p.scans.cdi.data.support.kind == "rectangle"

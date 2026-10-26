@@ -67,11 +67,19 @@ class Paths(object):
         if not self.home.endswith(sep):
             self.home += sep
 
+        #for key in ['autosave', 'autoplot', 'recon']:
+        #    v = self.__dict__[key]
+        #    if isinstance(v, str):
+        #        if not v.startswith(os.path.sep):
+        #            self.__dict__[key] = self.home + v
         for key in ['autosave', 'autoplot', 'recon']:
-            v = self.__dict__[key]
-            if isinstance(v, str):
-                if not v.startswith(os.path.sep):
-                    self.__dict__[key] = self.home + v
+            value = self.__dict__[key]
+
+            if isinstance(value, str):
+                self.__dict__[key] = os.path.join(
+                    self.home,
+                    value,
+                )
 
     def run(self, run):
         """

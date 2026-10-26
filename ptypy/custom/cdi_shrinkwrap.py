@@ -60,23 +60,66 @@ def _validate_closing_iterations(closing_iterations: int) -> None:
         )
 
 
+def _otsu_threshold(amplitude: Array) -> float:
+    """Return a 256-bin Otsu threshold for finite, nonnegative amplitudes.
+
+    The caller checks positive maximum. Normalize before calculating class
+    variances to avoid sensitivity to the absolute reconstruction scale.
+    A constant image has no two-class split and returns its sole value.
+    """
+    maximum = float(amplitude.max())
+    values = amplitude / maximum
+    lower, upper = float(values.min()), float(values.max())
+    if lower == upper:
+        return float(amplitude.flat[0])
+
+    counts, edges = np.histogram(values, bins=256, range=(lower, upper))
+    counts = counts.astype(np.float64)
+    centers = (edges[:-1] + edges[1:]) * 0.5
+    weight_left = np.cumsum(counts)
+    weight_right = np.cumsum(counts[::-1])[::-1]
+    mean_left = np.divide(
+        np.cumsum(counts * centers), weight_left,
+        out=np.zeros_like(centers), where=weight_left > 0,
+    )
+    mean_right = np.divide(
+        np.cumsum((counts * centers)[::-1])[::-1], weight_right,
+        out=np.zeros_like(centers), where=weight_right > 0,
+    )
+    variance = (
+        weight_left[:-1] * weight_right[1:]
+        * (mean_left[:-1] - mean_right[1:]) ** 2
+    )
+    return float(centers[:-1][np.argmax(variance)] * maximum)
+
+
 def shrinkwrap_support(
     object_field: Array,
     *,
     sigma_px: float | tuple[float, float] | Array,
-    threshold: float,
+    threshold: float = 0.20,
     closing_iterations: int = 0,
+    threshold_method: str = "otsu",
 ) -> Array:
-    """Compute a boolean shrink-wrap support from a complex object field."""
+    """Threshold the Gaussian-smoothed modulus of a complex object.
+
+    threshold_method='otsu' uses automatic global Otsu thresholding over
+    all pixels. threshold is ignored in that mode. A positive constant
+    image returns full support before optional closing; a zero image is
+    rejected. threshold_method='relative' preserves the original rule
+    blurred_amplitude >= threshold * blurred_amplitude.max().
+    """
     sigma = _validate_sigma(sigma_px, parameter_name="sigma_px")
     _validate_closing_iterations(closing_iterations)
 
-    if not 0.0 < threshold < 1.0:
+    if threshold_method not in ("otsu", "relative"):
+        raise ValueError("threshold_method must be 'otsu' or 'relative'.")
+    if threshold_method == "relative" and not 0.0 < threshold < 1.0:
         raise ValueError("threshold must lie strictly between 0 and 1.")
 
     object_field = np.asarray(object_field)
 
-    if object_field.ndim != 2:
+    if object_field.ndim != 2 or 0 in object_field.shape:
         raise ValueError("object_field must be a two-dimensional array.")
 
     if not np.all(np.isfinite(object_field)):
@@ -93,7 +136,12 @@ def shrinkwrap_support(
             "blurred object amplitude has no positive finite maximum."
         )
 
-    support = blurred_amplitude >= threshold * maximum
+    if threshold_method == "relative":
+        support = blurred_amplitude >= threshold * maximum
+    elif float(blurred_amplitude.min()) == maximum:
+        support = np.ones(blurred_amplitude.shape, dtype=bool)
+    else:
+        support = blurred_amplitude > _otsu_threshold(blurred_amplitude)
 
     if closing_iterations:
         support = binary_closing(
@@ -129,12 +177,18 @@ class CDIShrinkWrap(BaseEngine):
     lowlim = 0.0
     help = Initial Gaussian blur width in pixels
 
+    [threshold_method]
+    default = otsu
+    type = str
+    choices = ['otsu', 'relative']
+    help = Binarization method for the Gaussian-smoothed object modulus
+
     [threshold]
     default = 0.20
     type = float
     lowlim = 0.0
     uplim = 1.0
-    help = Relative blurred-amplitude threshold
+    help = Relative blurred-amplitude threshold, used only with threshold_method=relative
 
     [sigma_decay]
     default = 0.99
@@ -176,7 +230,9 @@ class CDIShrinkWrap(BaseEngine):
                 "minimum_sigma_px must not exceed gaussian_sigma_px."
             )
 
-        if not 0.0 < self.p.threshold < 1.0:
+        if self.p.threshold_method not in ("otsu", "relative"):
+            raise ValueError("threshold_method must be 'otsu' or 'relative'.")
+        if self.p.threshold_method == "relative" and not 0.0 < self.p.threshold < 1.0:
             raise ValueError("threshold must lie strictly between 0 and 1.")
 
         if not 0.0 < self.p.sigma_decay <= 1.0:
@@ -217,6 +273,7 @@ class CDIShrinkWrap(BaseEngine):
                         pod.object,
                         sigma_px=self._sigma,
                         threshold=self.p.threshold,
+                        threshold_method=self.p.threshold_method,
                         closing_iterations=self.p.closing_iterations,
                     )
                     set_cdi_support(self.ptycho, pod, new_support)

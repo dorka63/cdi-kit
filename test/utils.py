@@ -25,24 +25,65 @@ def get_test_data_path(name):
                     ['test_data/', name,'/'])
 
 
-def PtyscanTestRunner(ptyscan_instance, data_params, save_type='append', auto_frames=20, ncalls=1, cleanup=True):
-        u.verbose.set_level(3)
-        out_dict = {}
-        outdir = tempfile.mkdtemp()
-        data_params.dfile = '%s/prep.h5' % outdir
-        out_dict['output_file'] = data_params.dfile
-        data_params.save = save_type
-        a = ptyscan_instance(data_params)
-        a.initialize()
-        out_dict['msgs'] = []
-        i=0
-        while i<ncalls:
-            out_dict['msgs'].append(a.auto(auto_frames))
-            i+=1
+#def PtyscanTestRunner(ptyscan_instance, data_params, save_type='append', auto_frames=20, ncalls=1, cleanup=True):
+#        u.verbose.set_level(3)
+#        out_dict = {}
+#        outdir = tempfile.mkdtemp()
+#        data_params.dfile = '%s/prep.h5' % outdir
+#        out_dict['output_file'] = data_params.dfile
+#        data_params.save = save_type
+#        a = ptyscan_instance(data_params)
+#        a.initialize()
+#        out_dict['msgs'] = []
+#        i=0
+#        while i<ncalls:
+#            out_dict['msgs'].append(a.auto(auto_frames))
+#            i+=1
+#        if cleanup:
+#            shutil.rmtree(outdir)
+#        return out_dict
+
+def PtyscanTestRunner(
+    ptyscan_instance,
+    data_params,
+    save_type="append",
+    auto_frames=20,
+    ncalls=1,
+    cleanup=True,
+):
+    u.verbose.set_level(3)
+
+    out_dict = {}
+    outdir = tempfile.mkdtemp()
+
+    data_params.dfile = os.path.join(outdir, "prep.h5")
+    data_params.save = save_type
+
+    out_dict["output_file"] = data_params.dfile
+    out_dict["msgs"] = []
+
+    loader = None
+
+    try:
+        loader = ptyscan_instance(data_params)
+        loader.initialize()
+
+        for _ in range(ncalls):
+            out_dict["msgs"].append(
+                loader.auto(auto_frames)
+            )
+    finally:
+        # Close loader-owned files before tests remove their input folders.
+        if loader is not None:
+            close_files = getattr(loader, "close_files", None)
+
+            if callable(close_files):
+                close_files()
+
         if cleanup:
             shutil.rmtree(outdir)
-        return out_dict
 
+    return out_dict
 
 def EngineTestRunner(engine_params,propagator='farfield',output_path='./', output_file=None,
                     autosave=True, scanmodel="Full", verbose_level="info", init_correct_probe=False,
@@ -53,7 +94,11 @@ def EngineTestRunner(engine_params,propagator='farfield',output_path='./', outpu
     p.verbose_level = verbose_level
     p.io = u.Param()
     p.io.home = output_path
-    p.io.rfile = "%s.ptyr" % output_file
+    p.io.rfile = (
+        None
+        if output_file is None
+        else "%s.ptyr" % output_file
+    )
     p.io.interaction = u.Param()
     p.io.interaction.active = False
     p.io.autosave = u.Param(active=autosave)
@@ -94,7 +139,11 @@ def EngineTestRunner2(engine_params,propagator='farfield',output_path='./', outp
     p.verbose_level = verbose_level
     p.io = u.Param()
     p.io.home = output_path
-    p.io.rfile = "%s.ptyr" % output_file
+    p.io.rfile = (
+        None
+        if output_file is None
+        else "%s.ptyr" % output_file
+    )
     p.io.interaction = u.Param()
     p.io.interaction.active = False
     p.io.autosave = u.Param(active=autosave)

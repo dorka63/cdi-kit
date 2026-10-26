@@ -59,3 +59,20 @@ def test_parallel_matches_serial_across_support_updates(propagation):
 def test_invalid_worker_count(workers):
     with pytest.raises(ValueError, match="workers"):
         CDIEnsemble(_parameters("farfield"), seeds=(1, 2), workers=workers)
+
+
+@pytest.mark.parametrize("propagation", ["farfield", "nearfield"])
+def test_parallel_native_rectangle_binning_matches_serial(propagation):
+    p = _parameters(propagation)
+    p.scans.cdi.data.rebin = 2
+    p.scans.cdi.data.support = u.Param(kind="rectangle", oversampling=2.0)
+    with CDIEnsemble(p, seeds=(1, 2), workers=1) as serial, \
+         CDIEnsemble(p, seeds=(1, 2), workers=2) as parallel:
+        serial.run()
+        parallel.run()
+        assert parallel.fields.shape == serial.fields.shape == (2, 8, 8)
+        np.testing.assert_allclose(parallel.fields, serial.fields, rtol=1e-10, atol=1e-10)
+        np.testing.assert_array_equal(parallel.support, serial.support)
+        np.testing.assert_array_equal(parallel.pod.diff, serial.pod.diff)
+        np.testing.assert_array_equal(parallel.pod.mask, serial.pod.mask)
+        assert parallel._worker_parameters.scans.cdi.data.rebin == 1

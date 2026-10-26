@@ -368,3 +368,117 @@ def test_remove_global_phase_preserves_far_field_intensity():
         rtol=1e-12,
         atol=1e-12,
     )
+
+
+# Native support construction is finalized after PtyScan preprocessing.
+def _native_support_case(kind="rectangle", rebin=2, orientation=None, **support_options):
+    from ptypy.custom.cdi_common import cdi_support
+    y, x = np.indices((32, 32))
+    intensity = 2.0 + y + 2.0 * x
+    mask = np.ones((32, 32), dtype=bool)
+    mask[2, 4] = False
+    p = _cdi_scan_params(intensity, mask)
+    p.scans.cdi.propagation = "nearfield"
+    p.scans.cdi.ffttype = "numpy"
+    p.scans.cdi.data.update(u.Param(center="fftshift", autocenter=False,
+        rebin=rebin, orientation=orientation, support=u.Param(kind=kind, **support_options)))
+    reconstruction = Ptycho(p, level=2)
+    pod = next(iter(reconstruction.pods.values()))
+    return reconstruction, pod, cdi_support(reconstruction, pod), intensity, mask
+
+
+@pytest.mark.parametrize("rebin", [1, 2, 4])
+@pytest.mark.parametrize("oversampling", [2.0, (2.0, 4.0)])
+def test_rectangle_native_rebin_uses_final_object_grid(rebin, oversampling):
+    p, pod, support, raw, mask = _native_support_case(
+        rebin=rebin, oversampling=oversampling)
+    expected = rectangular_support(pod.object.shape, oversampling=oversampling)
+    np.testing.assert_array_equal(support, expected)
+    assert support.shape == pod.object.shape == pod.diff.shape == pod.mask.shape
+    assert support.shape == (32 // rebin, 32 // rebin)
+    expected_data = raw if rebin == 1 else u.rebin_2d(raw[None], rebin)[0]
+    np.testing.assert_allclose(pod.diff, expected_data)
+    counts = mask.astype(int) if rebin == 1 else u.rebin_2d(mask[None].astype(int), rebin)[0]
+    np.testing.assert_array_equal(pod.mask, counts == counts.max())
+    np.testing.assert_allclose(p.model.scans["cdi"].geometries[0].psize,
+                               np.array([55e-6, 55e-6]) * rebin)
+
+
+def test_rectangle_native_default_oversampling():
+    _, pod, support, _, _ = _native_support_case(rebin=2)
+    np.testing.assert_array_equal(support, rectangular_support(pod.object.shape, 2.0))
+
+
+@pytest.mark.parametrize("rebin", [1, 2, 4])
+def test_circle_native_rebin_radius_is_final_grid_pixels(rebin):
+    _, pod, support, _, _ = _native_support_case("circle", rebin=rebin, radius=2.0)
+    np.testing.assert_array_equal(support, circular_support(pod.object.shape, 2.0))
+
+
+def test_rectangle_native_explicit_center_is_on_final_grid():
+    _, pod, support, _, _ = _native_support_case(rebin=2,
+        oversampling=(4.0, 2.0), center=(4.0, 11.0))
+    expected = rectangular_support(pod.object.shape, (4.0, 2.0), center_px=(4.0, 11.0))
+    np.testing.assert_array_equal(support, expected)
+    assert support[4, 11] and not support[12, 4]
+
+
+def test_rectangle_native_auto_center_uses_preprocessed_intensity():
+    from ptypy.custom.cdi_common import estimate_cdi_center
+    _, pod, support, _, _ = _native_support_case(rebin=2, oversampling=4.0, center="auto")
+    center, _ = estimate_cdi_center(pod.diff, pod.mask, method="mass")
+    np.testing.assert_array_equal(support,
+        rectangular_support(pod.object.shape, 4.0, center_px=center))
+
+
+@pytest.mark.parametrize("oversampling", [0.0, 0.5, -1.0, float("nan"), float("inf"),
+                                         (2.0, 0.5), (2.0, 3.0, 4.0)])
+def test_rectangle_native_rejects_invalid_oversampling(oversampling):
+    with pytest.raises(ValueError):
+        _native_support_case(oversampling=oversampling)
+
+
+def test_support_set_and_get_share_one_cache():
+    from ptypy.custom.cdi_common import cdi_support, set_cdi_support
+    p, pod, original, _, _ = _native_support_case()
+    replacement = np.zeros_like(original)
+    replacement[1:4, 2:6] = True
+    set_cdi_support(p, pod, replacement)
+    np.testing.assert_array_equal(cdi_support(p, pod), replacement)
+    assert cdi_support(p, pod) is not replacement
+    with pytest.raises(ValueError, match="shape|grid"):
+        set_cdi_support(p, pod, np.ones((32, 32), dtype=bool))
+    np.testing.assert_array_equal(cdi_support(p, pod), replacement)
+
+
+@pytest.mark.parametrize("kind", ["array", "file"])
+def test_external_support_can_be_supplied_on_final_grid(kind, tmp_path):
+    expected = np.zeros((16, 16), bool)
+    expected[2:9, 5:13] = True
+    options = {"array": expected}
+    if kind == "file":
+        path = tmp_path / "support.npy"
+        np.save(path, expected)
+        options = {"file": str(path)}
+    _, _, support, _, _ = _native_support_case(kind, rebin=2, **options)
+    np.testing.assert_array_equal(support, expected)
+
+
+def test_external_raw_grid_mask_is_not_silently_resized():
+    with pytest.raises(ValueError, match="shape"):
+        _native_support_case("array", rebin=2, array=np.ones((32, 32), dtype=bool))
+
+
+def test_incompatible_native_rebin_reports_error():
+    with pytest.raises(RuntimeError, match="Binning|binning|shape"):
+        _native_support_case(rebin=3)
+
+
+def test_rectangle_native_orientation_and_rebin_keep_data_and_support_consistent():
+    orientation = (True, False, True)
+    _, pod, support, raw, _ = _native_support_case(rebin=2,
+        orientation=orientation, oversampling=(4.0, 2.0))
+    oriented, _ = u.switch_orientation(raw[None], orientation, np.array([16.0, 16.0]))
+    expected_data = u.rebin_2d(oriented, 2)[0]
+    np.testing.assert_allclose(pod.diff, expected_data)
+    np.testing.assert_array_equal(support, rectangular_support((16, 16), (4.0, 2.0)))

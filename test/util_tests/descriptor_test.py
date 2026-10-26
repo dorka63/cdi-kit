@@ -551,38 +551,86 @@ class EvalDescriptorTest(unittest.TestCase):
         p.io.autoplot = True
         out = root.check(p)
 
+#    def test_float_validation(self):
+#        """
+#        Check float validation.
+#        """
+#        import numpy as np
+#
+#        x = EvalDescriptor('')
+#        x.from_string("""
+#        [p]
+#        default = 0.
+#        type = float
+#        help = A parameter
+#        uplim = 5.
+#        lowlim = 0.""")
+
+#        # Basic test
+#        s = Param({'p': 1.})
+#        x.validate(s)
+
+#        # int to float
+#        s.p = 1
+#        x.validate(s)
+
+#        # numpy floats
+#        s.p = np.float16(1.)
+#        x.validate(s)
+#        s.p = np.float32(1.)
+#        x.validate(s)
+#        s.p = np.float64(1.)
+#        x.validate(s)
+#        s.p = np.float128(1.)
+#        x.validate(s)
+
     def test_float_validation(self):
-        """
-        Check float validation.
-        """
+        """Check float validation for types available on this platform."""
         import numpy as np
 
-        x = EvalDescriptor('')
+        x = EvalDescriptor("")
         x.from_string("""
         [p]
         default = 0.
         type = float
         help = A parameter
         uplim = 5.
-        lowlim = 0.""")
+        lowlim = 0.
+        """)
 
-        # Basic test
-        s = Param({'p': 1.})
+        # Python float.
+        s = Param({"p": 1.0})
         x.validate(s)
 
-        # int to float
+        # Python int accepted as a float parameter.
         s.p = 1
         x.validate(s)
 
-        # numpy floats
-        s.p = np.float16(1.)
-        x.validate(s)
-        s.p = np.float32(1.)
-        x.validate(s)
-        s.p = np.float64(1.)
-        x.validate(s)
-        s.p = np.float128(1.)
-        x.validate(s)
+        # Standard NumPy floating-point types.
+        float_types = [
+            np.float16,
+            np.float32,
+            np.float64,
+            np.longdouble,
+        ]
+
+        # This alias is not available on every platform.
+        float128 = getattr(np, "float128", None)
+
+        if float128 is not None:
+            float_types.append(float128)
+
+        checked = set()
+
+        for dtype in float_types:
+            if dtype in checked:
+                continue
+
+            checked.add(dtype)
+
+            with self.subTest(dtype=dtype.__name__):
+                s.p = dtype(1.0)
+                x.validate(s)
 
     def test_save_json(self):
 

@@ -136,8 +136,8 @@ def rectangular_support(
         sigma_rows = float(oversampling[0])
         sigma_columns = float(oversampling[1])
 
-    if sigma_rows <= 0 or sigma_columns <= 0:
-        raise ValueError("oversampling values must be positive.")
+    if not np.isfinite([sigma_rows, sigma_columns]).all() or sigma_rows <= 0 or sigma_columns <= 0:
+        raise ValueError("oversampling values must be positive and finite.")
 
     if sigma_rows < 1 or sigma_columns < 1:
         raise ValueError(
@@ -1055,7 +1055,17 @@ class CDIScan(PtyScan):
     [support.kind]
     default = autocorrelation
     type = str
-    help = One of autocorrelation, circle, file, array
+    help = One of autocorrelation, rectangle, circle, file, array
+
+    [support.oversampling]
+    default = 2.0
+    type = float, int, tuple, list
+    help = Grid size divided by rectangle size along each axis; values >= 1
+
+    [support.center]
+    default = 'frame'
+    type = str, tuple, list, None
+    help = Rectangle/circle center on the FINAL object grid: frame, auto, or (row, column)
 
     [support.threshold]
     default = 0.04
@@ -1075,17 +1085,17 @@ class CDIScan(PtyScan):
     [support.radius]
     default = None
     type = float
-    help = Circle radius in pixels (kind = circle)
+    help = Circle radius in FINAL object-grid pixels (kind = circle)
 
     [support.file]
     default = None
     type = str
-    help = Path to a .npy support mask (kind = file)
+    help = Path to a .npy mask on the FINAL object grid (kind = file)
 
     [support.array]
     default = None
     type = ndarray
-    help = Support mask supplied as an array (kind = array)
+    help = Support mask on the FINAL object grid (kind = array)
 
     [denoising]
     default =
@@ -1219,37 +1229,59 @@ class CDIScan(PtyScan):
         self.centering_diagnostics = payload["diagnostics"]
         return np.rint(payload["center"]).astype(int)
 
-    def _initial_support(self, pars):
-        """Compute the initial support from the data.support parameters."""
-        shape = self._intensity.shape
+    def _initial_support(self, pars, *, intensity=None, mask=None, shape=None):
+        """Build support; POD callers supply the final preprocessed object grid.
 
-        if pars.kind == "autocorrelation":
-            return support_from_autocorrelation(
-                self._intensity,
-                valid_mask=self._mask,
-                gaussian_sigma_px=pars.blur_sigma,
-                threshold=pars.threshold,
-                closing_iterations=pars.closing_iterations,
-            )
+        Constructor-time support remains available for direct CDIScan users.
+        cdi_support() rebuilds it once from the prepared POD before any engine
+        or ensemble member starts. Geometric coordinates and radius are final
+        object-grid pixels; array/file masks must already use that grid.
+        """
+        image = self._intensity if intensity is None else np.asarray(intensity)
+        valid = self._mask if mask is None else np.asarray(mask, dtype=bool)
+        target_shape = image.shape if shape is None else tuple(shape)
+        kind = pars.kind
 
-        if pars.kind == "circle":
+        if kind in ("rectangle", "circle"):
+            center = pars.get("center", "frame")
+            if isinstance(center, str):
+                if center == "frame":
+                    center = None
+                elif center == "auto":
+                    center, _ = estimate_cdi_center(image, valid, method="mass")
+                else:
+                    raise ValueError("data.support.center must be 'frame', 'auto', or (row, column).")
+            if center is not None:
+                center = np.asarray(center, dtype=float)
+                if center.shape != (2,) or not np.isfinite(center).all():
+                    raise ValueError("data.support.center must contain two finite coordinates.")
+                if np.any(center < 0) or np.any(center > np.asarray(target_shape) - 1):
+                    raise ValueError("data.support.center is outside the object grid.")
+                center = tuple(float(value) for value in center)
+            if kind == "rectangle":
+                return rectangular_support(shape=target_shape,
+                    oversampling=pars.get("oversampling", 2.0), center_px=center)
             if pars.radius is None:
                 raise ValueError("data.support.radius is required for kind='circle'.")
-            return circular_support(shape=shape, radius_px=pars.radius)
+            return circular_support(shape=target_shape, radius_px=pars.radius, center_px=center)
 
-        if pars.kind == "file":
+        if kind == "autocorrelation":
+            return support_from_autocorrelation(image, valid_mask=valid,
+                gaussian_sigma_px=pars.blur_sigma, threshold=pars.threshold,
+                closing_iterations=pars.closing_iterations)
+
+        # Defer external-mask shape validation until a prepared POD exists.
+        # It is legal to supply a final-grid mask smaller than the raw frame.
+        expected = None if intensity is None else target_shape
+        if kind == "file":
             if pars.file is None:
                 raise ValueError("data.support.file is required for kind='file'.")
-            return support_from_npy(pars.file, shape=shape)
-
-        if pars.kind == "array":
+            return support_from_npy(pars.file, shape=expected)
+        if kind == "array":
             if pars.array is None:
                 raise ValueError("data.support.array is required for kind='array'.")
-            return support_from_array(pars.array, shape=shape)
-
-        raise ValueError(
-            "data.support.kind must be 'autocorrelation', 'circle', 'file', or 'array'."
-        )
+            return support_from_array(pars.array, shape=expected)
+        raise ValueError("data.support.kind must be 'autocorrelation', 'rectangle', 'circle', 'file', or 'array'.")
 
     def load_positions(self):
         return np.zeros((1, 2))
@@ -1291,34 +1323,38 @@ class CDIScan(PtyScan):
         return processed, weights
 
 def cdi_support(ptycho, pod) -> Array:
-    """Return the current support of the object seen by ``pod``.
-
-    On first access the support is taken from the initial support computed
-    by the scan's ``CDIScan``. Later engines read or replace the same entry.
-    """
+    """Return support cached on the FINAL object grid, after native preprocessing."""
     supports = ptycho.__dict__.setdefault("cdi_supports", {})
     key = pod.ob_view.storageID
-
     if key not in supports:
-        supports[key] = pod.model.ptyscan.support.copy()
-
+        scan = pod.model.ptyscan
+        if isinstance(scan, CDIScan):
+            initial = scan._initial_support(scan.info.support,
+                intensity=pod.diff, mask=pod.mask, shape=pod.object.shape)
+            scan.support = initial.copy()
+        else:
+            initial = scan.support
+        initial = support_from_array(initial, shape=pod.object.shape)
+        supports[key] = initial.copy()
     return supports[key]
 
 
-def set_cdi_support(ptycho, pod, support: Array) -> None:
-    """Replace the current support of the object seen by ``pod``."""
-    current = cdi_support(ptycho, pod)
+def set_cdi_support(ptycho, pod, support):
+    """Replace the support on the current object grid."""
     support = np.asarray(support, dtype=bool)
+    expected_shape = pod.object.shape
 
-    if support.shape != current.shape:
+    if support.shape != expected_shape:
         raise ValueError(
-            f"support shape must be {current.shape}; got {support.shape}."
+            f"Support shape must match the object grid: "
+            f"{expected_shape}; got {support.shape}."
         )
 
     if not np.any(support):
-        raise ValueError("support must contain at least one True pixel.")
+        raise ValueError("Support must contain at least one True pixel.")
 
-    ptycho.cdi_supports[pod.ob_view.storageID] = support.copy()
+    supports = ptycho.__dict__.setdefault("cdi_supports", {})
+    supports[pod.ob_view.storageID] = support.copy()
 
 def remove_global_phase(
     object_field: Array,

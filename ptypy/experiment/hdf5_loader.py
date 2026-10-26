@@ -401,6 +401,45 @@ class Hdf5Loader(PtyScan):
             log(3, "This scan looks to be an unmapped raster scan.")
             self.load = self.load_unmapped_raster_scan
 
+    def close_files(self):
+        """Close HDF5 files owned by this loader.
+
+        Safe to call more than once.
+        """
+        handle_names = (
+            "fhandle_intensities",
+            "fhandle_positions_fast",
+            "fhandle_positions_slow",
+            "fhandle_darkfield",
+            "fhandle_flatfield",
+            "fhandle_normalisation",
+            "fhandle_mask",
+        )
+
+        errors = []
+
+        for name in handle_names:
+            handle = getattr(self, name, None)
+
+            if handle is None:
+                continue
+
+            try:
+                handle.close()
+            except Exception as error:
+                errors.append((name, error))
+            else:
+                setattr(self, name, None)
+
+        if errors:
+            names = ", ".join(name for name, _ in errors)
+
+            raise RuntimeError(
+                f"Could not close HDF5 handles: {names}"
+            ) from errors[0][1]
+
+
+
     def _params_check(self):
         """
         raise error if essential parameters mising

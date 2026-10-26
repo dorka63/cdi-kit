@@ -101,7 +101,7 @@ class CDIEnsemble:
     io.rfile is configured. A normal context-manager exit calls finalize().
     No shrink-wrap implementation is included.
     """
-    def __init__(self, parameters, seeds=range(8), workers=1):
+    def __init__(self, parameters, seeds=range(8), workers=1, support_factory=None):
         if parallel.size != 1:
             raise ValueError("MPI execution is not supported by CDIEnsemble.")
         self.seeds = tuple(seeds)
@@ -139,8 +139,13 @@ class CDIEnsemble:
         pods = list(self.ptycho.pods.values())
         if len(pods) != 1 or not pods[0].active:
             raise ValueError("Exactly one active POD is required.")
+
         self.pod = pods[0]
         self.pod.probe = np.ones(self.pod.probe.shape, dtype=self.ptycho.CType)
+        if support_factory is not None:
+            if not callable(support_factory):
+                raise TypeError("support_factory must be callable.")
+            set_cdi_support(self.ptycho, self.pod, support_factory(self.pod))
         self.support = cdi_support(self.ptycho, self.pod).copy()
         if self.support.shape != self.pod.object.shape:
             raise ValueError("Support and object shapes must match.")
